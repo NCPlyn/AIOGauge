@@ -14,9 +14,11 @@ All-In-One-Oil-Gauge; a ESP32S3 project that uses Bosch pressure and temperature
 
 ## Sponsored by PCBWay
 
-This project was made possible thanks to **[PCBWay](https://www.pcbway.com/)**, who kindly sponsored the **prototype PCBs**.  
-They also assembled the **SMD components** on my prototype, delivering great quality at a very affordable price.  
+This project was made possible thanks to **[PCBWay](https://www.pcbway.com/)**, who kindly sponsored the **prototype PCBs** and handled the **SMD assembly**.
 
+The PCBWay team discussed with me which parts would be sourced and used, and they were even able to assemble just a **single prototype board** - perfect for development. Before soldering, they sent me pictures of the component placement for confirmation, which gave me a lot of confidence in the build.  
+  
+The boards arrived quickly, the assembly quality was excellent, and I really appreciated the wide variety of PCB options available. 
 If you’re looking for PCB prototyping or assembly, PCBWay offers quick turnaround, reliable manufacturing, and professional assembly services. 
 
 ![PCBWay](https://www.pcbway.com/project/img/images/frompcbway.png)
