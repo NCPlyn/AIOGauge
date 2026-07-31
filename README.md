@@ -1,6 +1,12 @@
 # AIOGauge
 
-All-In-One-Oil-Gauge; a ESP32S3 project that uses Bosch pressure and temperature [sensor](https://www.bosch-motorsport.com/content/downloads/Raceparts/en-GB/54249355.html), accelerometer for G force and GPS for speed, all information gets shown on round GC9A01 TFT display...
+All-In-One-Oil-Gauge; a ESP32S3 project that uses:
+- **PST-F 1** Bosch pressure and temperature [sensor](https://www.bosch-motorsport.com/content/downloads/Raceparts/en-GB/54249355.html) (0261230482 / 0261230341 / 0261230340 etc + 1928405159 connector)
+- **LSM6DS3** accelerometer for G force realtime monitor
+- **ATGM336H** GPS for realtime speed monitor + 0-100km/h / 0-60mph 10Hz timer
+- **GC9A01** round TFT display shows all information
+- Setup configuration via two buttons
+- **WiFi** to update firmware (TBD settings, long time logging etc...)
 
 **Project in development**
 
