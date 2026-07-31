@@ -1,8 +1,17 @@
-//AIOilGauge >>> All-In-One-Oil-Gauge
+//AIOGauge >>> All-In-One-Oil-Gauge
 
-//test all (buzzer, output, drag, sensor input, settings)
-//make pcb, there are 2 versions of the sensor?
-//0-100 option?, display main, display settings padding
+/*
+PCB fix:
+- rotate screen connector 180°
+- add resistor to temp (4.7k-5V)
+- louder buzzer/tranzistor
+- ESP32S3 without module + antenna (https://files.waveshare.com/wiki/ESP32-S3-Zero/ESP32-S3-Zero-Sch.pdf)
+- relocate gps to back?
+Design enclosure
+Write down sensor pinout to cable to PCB
+Drag final time show on screen
+Utilize web somehow?
+*/
 
 // ----- User Settings ----- (350, loads that if not saved)
 int alarmTemp = 130; //above this temperature is alarm
@@ -13,7 +22,7 @@ bool invertOutput = false; //true for pressureOutput = normally floating
 bool buzzerEna = true; //enable or disable
 bool dragEna = false; //enable or disable
 
-//GPS Serial1 = TX16, RX15
+//GPS Serial1 = ESP TX->17 (to GPS RXD), ESP RX<-18 (from GPS TXD)
 //ADC I2C = SDA8, SCL9 via level shifter
 //TFT SPI = MOSI11, CLK12, CS10, DC13, RST14
 //BOSCH = TempA0+4.7k5v, PressA1
@@ -21,6 +30,12 @@ int pressureOutput = 15; //pressure alarm output pin, normally grounded
 int buzzerOutput = 4;
 int settA = 6, settB = 7;
 int BL_PIN = 5;
+int GPS_TX_PIN = 17; //ESP32 TX -> GPS RXD
+int GPS_RX_PIN = 18; //ESP32 RX <- GPS TXD
+
+//http://192.168.4.1/update for OTA, /log for logs
+const char *otaSSID = "AIOGauge";
+const char *otaPassword = "12345678";
 
 // ----- Code -----
 #include <TFT_eSPI.h>
@@ -31,12 +46,17 @@ int BL_PIN = 5;
 #include <SparkFunLSM6DS3.h>
 #include <TinyGPS++.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ElegantOTA.h>
 
 Preferences preferences;
 TinyGPSPlus gps;
 Adafruit_ADS1115 ads;
 TFT_eSPI tft = TFT_eSPI();
-LSM6DS3 myIMU;
+LSM6DS3 myIMU(I2C_MODE, 0x6A);
+AsyncWebServer server(80);
 
 uint16_t colorTemp = 0x0000, colorPress = 0x0000, dragTime = 0, valupdate = 0, dragStart = 0, color;
 bool gpsReady = false, lastOPval = false;
@@ -79,6 +99,31 @@ float interpolateTemperature(float resistance) {
 }
 
 // ----- Misc funcs -----
+//realtime logger
+#define LOG_BUFFER_SIZE (50 * 1024)  // 50 KB
+char *logBuffer = nullptr;
+size_t logIndex = 0;
+void logPrint(const char *str) {
+  Serial.println(str);
+  if (!logBuffer) return;
+  size_t len = strlen(str);
+  size_t needed = len + 1; //newline
+  if (logIndex + needed >= LOG_BUFFER_SIZE) {
+    logIndex = 0;
+    logBuffer[0] = '\0';
+  }
+  memcpy(logBuffer + logIndex, str, len);
+  logIndex += len;
+  logBuffer[logIndex++] = '\n';
+  logBuffer[logIndex] = '\0';
+}
+inline void logPrint(const __FlashStringHelper *str) {
+  logPrint((const char*)str);
+}
+void logPrint(const String &str) {
+    logPrint(str.c_str());
+}
+
 //Map function for float
 float mapfloat(float x, float in_min, float in_max, float out_min, float out_max) {
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
@@ -91,6 +136,66 @@ void TFT_SET_BL(uint8_t Value) {
   } else {
     ledcWrite(BL_PIN, Value * 2.55);
   }
+}
+
+// ----- GPS auto-baud detect & configure -----
+//Waits up to timeoutMs on the CURRENT Serial1 baud rate for a checksum-validNMEA sentence.
+bool gpsBaudIsValid(uint32_t timeoutMs) {
+  TinyGPSPlus probe;
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    while (Serial1.available() > 0) {
+      if (probe.encode(Serial1.read())) {
+        return true; //got a full, checksum-valid sentence at this baud
+      }
+    }
+  }
+  return false;
+}
+
+//Sends the CASIC config strings to reconfigure the ATGM336H module.
+void sendGPSConfig() {
+  Serial1.println("$PCAS04,1*18"); //GPS only (no BDS/GLONASS)
+  delay(100);
+  Serial1.println("$PCAS11,3*1E"); //automotive mode
+  delay(100);
+  Serial1.println("$PCAS03,1,0,0,0,0,1,0,,,,,,,*32"); //only GGA+VTG output
+  delay(100);
+  Serial1.println("$PCAS02,100*1E"); //10Hz update rate
+  delay(100);
+  Serial1.println("$PCAS01,5*19"); //baud -> 115200 (module switches now)
+  delay(200);
+}
+
+//Detects current module state and gets it (and our UART) onto 115200/10Hz/GPS-only.
+void setupGPS() {
+  //Assume normal operating state first: 115200
+  Serial1.begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  delay(50);
+  Serial1.flush();
+  while (Serial1.available()) { Serial1.read(); } //clear any boot garbage
+  if (gpsBaudIsValid(1500)) {
+    logPrint("GPS: already running at 115200, skipping reconfigure");
+    return;
+  }
+
+  //Fell back to factory default 9600 (e.g. battery-backed RAM lost after low VBAT)
+  Serial1.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  delay(50);
+  Serial1.flush();
+  while (Serial1.available()) { Serial1.read(); }
+  if (gpsBaudIsValid(1500)) {
+    logPrint("GPS: found at 9600 (default), sending reconfigure...");
+    sendGPSConfig();
+    Serial1.begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    delay(100);
+    logPrint("GPS: reconfigured and switched to 115200");
+    return;
+  }
+
+  //Neither responded (module still booting / not connected) - default to 115200
+  logPrint("GPS: no response at 115200 or 9600, defaulting to 115200");
+  Serial1.begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 }
 
 //RGB stuff
@@ -187,7 +292,7 @@ void drawTemp(long val, bool imper) {
         drawCenterText(90, 22, 1, TFT_WHITE, TFT_RED, "Temp");
         colorTemp = TFT_RED;
         if(buzzerEna && millis()>10000) {
-          tone(buzzerOutput,6262,1000);
+          tone(buzzerOutput,4000,1000);
         }
         lastTemp = -1;
       }
@@ -254,7 +359,7 @@ void drawPress(float val, bool PSI) {
         drawCenterText(149, 23, 1, TFT_WHITE, TFT_RED, "Press");
         colorPress = TFT_RED;
         if(buzzerEna && millis()>10000) {
-          tone(buzzerOutput,6262,1000);
+          tone(buzzerOutput,4000,1000);
         }
         lastPress = -1;
       }
@@ -323,7 +428,7 @@ void drawG(float fG, float sG) {
 // ----- Temperature Sensor on ADS1115 Channel 0 -----
 long getTemp(bool imper) {
   // V_out = V_supply * (R_sensor / (R_sensor + R_pullup))
-  float sensorResistance = pullupResistor * (supplyVoltage / ads.computeVolts(ads.readADC_SingleEnded(0)) - 1);
+  float sensorResistance = pullupResistor / (supplyVoltage / ads.computeVolts(ads.readADC_SingleEnded(0)) - 1);
   //Interpolate & return temperature from the resistance value
   float sensorTemperature = interpolateTemperature(sensorResistance);
   if(imper) {
@@ -371,6 +476,26 @@ void saveSettings() {
   preferences.end();
 }
 
+void setupWebServer() {
+  logBuffer = (char*)malloc(LOG_BUFFER_SIZE + 1);
+  if (logBuffer) {
+    logBuffer[0] = '\0';
+    logIndex = 0;
+  }
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(otaSSID, otaPassword);
+  logPrint("WiFi AP started: " + String(otaSSID) + " @ " + WiFi.softAPIP().toString());
+
+  server.on("/log", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", logBuffer ? logBuffer : "(log buffer not allocated)");
+  });
+
+  ElegantOTA.begin(&server); //adds the /update page
+  server.begin();
+  logPrint("Web server + OTA ready");
+}
+
 void drawUI() {
   tft.fillScreen(TFT_BLACK);
   tft.setFreeFont(FSS9);
@@ -396,6 +521,8 @@ void setup() {
   pinMode(BL_PIN, OUTPUT);
   //Init debug serial
   Serial.begin(115200);
+  //Init WiFi AP + OTA update page + realtime log page (needs Serial for logPrint's debug echo)
+  setupWebServer();
   //Load settings
   preferences.begin("settings", true); //preferences.putUInt("counter", counter);
   alarmTemp = preferences.getInt("aTemp",130);
@@ -410,15 +537,15 @@ void setup() {
   //Brightness pin
   ledcAttach(BL_PIN, 25000, 8);
   ledcWrite(BL_PIN, bright);
-  //Init gps
-  Serial1.begin(115200);
+  //Init/configure gps
+  setupGPS();
   //Init TFT
   TFT_SET_BL(bright);
   tft.begin();
-  tft.setRotation(3); //Adjust rotation if needed
+  tft.setRotation(2); //Adjust rotation if needed
   //Init ADC
   if (!ads.begin()) {
-    Serial.println("Failed to initialize ADS1115!");
+    logPrint("Failed to initialize ADS1115!");
     drawCenterText(120, 120, 1, TFT_WHITE, TFT_BLACK, "ADC ERROR");
     while (1); //Halt if initialization fails
   } else {
@@ -427,12 +554,14 @@ void setup() {
     Wire.setClock(800000);
   }
   if(myIMU.begin()) {
-    Serial.println("[E] An Error has occurred while connecting to LSM!");
+    logPrint("[E] An Error has occurred while connecting to LSM!");
   }
   drawUI();
 }
 
 void loop(void) {
+  ElegantOTA.loop(); //services pending OTA update/reboot requests
+
   //Feed gps
   while(Serial1.available() > 0) {
     if(gps.encode(Serial1.read())) {
@@ -472,8 +601,8 @@ void loop(void) {
     tempVal = getTemp(useImperial);
     pressVal = round(getPress(usePSI) * 10) / 10.0;
     speedVal = getSpeed(useImperial);
-    fG = myIMU.readFloatAccelX();
-    sG = myIMU.readFloatAccelY();
+    fG = myIMU.readFloatAccelZ();
+    sG = myIMU.readFloatAccelX();
     drawG(fG,sG);
     drawTemp(tempVal,useImperial);
     drawPress(pressVal,usePSI);
@@ -664,7 +793,7 @@ void loop(void) {
           while(digitalRead(settB) == LOW) {
             if(millis()>debounce+1000) {
               preferences.begin("settings", false);
-              preferences.putULong("dragTime",dragTime);
+              preferences.putULong("dragTime",0);
               preferences.end();
               tft.drawString("RESET", valueSide, downAmnt+(17*currentMenu));
               if(useImperial) {
