@@ -9,8 +9,6 @@ PCB fix:
 - relocate gps to back?
 Design enclosure
 Write down sensor pinout to cable to PCB
-Drag final time show on screen
-Utilize web somehow?
 */
 
 // ----- User Settings ----- (350, loads that if not saved)
@@ -21,6 +19,7 @@ bool usePSI = false; //true for PSI, false for bar
 bool invertOutput = false; //true for pressureOutput = normally floating
 bool buzzerEna = true; //enable or disable
 bool dragEna = false; //enable or disable
+bool tftEnabled = true; //physical TFT on/off (phone can be the screen)
 
 //GPS Serial1 = ESP TX->17 (to GPS RXD), ESP RX<-18 (from GPS TXD)
 //ADC I2C = SDA8, SCL9 via level shifter
@@ -49,7 +48,9 @@ const char *otaPassword = "12345678";
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <AsyncWebSocket.h>
 #include <ElegantOTA.h>
+#include <LittleFS.h>
 
 Preferences preferences;
 TinyGPSPlus gps;
@@ -57,11 +58,46 @@ Adafruit_ADS1115 ads;
 TFT_eSPI tft = TFT_eSPI();
 LSM6DS3 myIMU(I2C_MODE, 0x6A);
 AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
 
 uint16_t colorTemp = 0x0000, colorPress = 0x0000, dragTime = 0, valupdate = 0, dragStart = 0, color;
 bool gpsReady = false, lastOPval = false;
+volatile bool tftPowerPending = false;
 long tempVal = 140, speedVal = 0, DnowSpeed = 0, DlastSpeed = 0, lastTemp = 0, bright = 100,lastSpeed = -10;
 float pressVal = 0, fG = -5.0, sG = -5.0, lastPress = 0;
+int lastDot[2] = {175, 175};
+
+// ----- Ride logging -----
+#define RIDE_BUDGET_BYTES (400 * 1024)
+#define RIDE_BUF_SAMPLES 64
+#define LOG_SAMPLE_MS 500
+
+struct __attribute__((packed)) LogSample {
+  int16_t press_x100; // bar * 100
+  int16_t temp_c;     // °C
+  int16_t speed_kmh;  // km/h; -1 if GPS invalid
+};
+
+LogSample rideBuf[RIDE_BUF_SAMPLES];
+size_t rideBufCount = 0;
+fs::File rideFile;
+uint16_t currentRideId = 0;
+unsigned long logupdate = 0;
+bool rideLogging = false;
+
+// ----- Drag result overlay -----
+unsigned long dragShowUntil = 0;
+unsigned long dragShowCurrent = 0;
+unsigned long dragShowBest = 0;
+bool dragShowNewBest = false;
+
+void drawCenterText(int centerX, int centerY, int textSize, uint16_t fColor, uint16_t bColor, String text);
+void drawUI();
+void TFT_SET_BL(uint8_t Value);
+void applyTftPower();
+void showDragOverlay();
+String liveToJson();
+String formatDragMs(unsigned long ms);
 
 // ----- Temperature Sensor Parameters -----
 const float pullupResistor = 4600.0; //Pull-up resistor (ohms)
@@ -129,12 +165,37 @@ float mapfloat(float x, float in_min, float in_max, float out_min, float out_max
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
-//Screen dimming
+//Screen dimming (0 = off, 1–100 = brightness %)
 void TFT_SET_BL(uint8_t Value) {
-  if (Value < 0 || Value > 100) {
+  if (Value > 100) {
     printf("TFT_SET_BL Error \r\n");
   } else {
-    ledcWrite(BL_PIN, Value * 2.55);
+    ledcWrite(BL_PIN, (uint32_t)(Value * 2.55f));
+  }
+}
+
+void invalidateGaugeCaches() {
+  lastTemp = -2;
+  lastPress = -2;
+  lastSpeed = -2;
+  colorTemp = TFT_RED;
+  colorPress = TFT_RED;
+  lastDot[0] = 175;
+  lastDot[1] = 175;
+}
+
+void applyTftPower() {
+  if (tftEnabled) {
+    TFT_SET_BL((uint8_t)bright);
+    if (dragShowUntil != 0) {
+      showDragOverlay();
+    } else {
+      tft.fillScreen(TFT_BLACK);
+      drawUI();
+      invalidateGaugeCaches();
+    }
+  } else {
+    TFT_SET_BL(0);
   }
 }
 
@@ -217,14 +278,185 @@ uint16_t hsvToRgb(uint8_t hue) {
 }
 uint8_t hue = 0;
 
-String getStringTime() {
-  if(dragTime == 0) {
-    return " None ";
+String formatDragMs(unsigned long ms) {
+  if (ms == 0) {
+    return "None";
   }
-  unsigned long seconds = dragTime / 1000;
-  int decimal = (dragTime % 1000) / 10; // Extract 2 decimal places
-  return String(seconds) + "." + (decimal < 10 ? "0s" : "s") + String(decimal);
-} 
+  unsigned long seconds = ms / 1000;
+  int decimal = (ms % 1000) / 10;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%lu.%02ds", seconds, decimal);
+  return String(buf);
+}
+
+String getStringTime() {
+  return formatDragMs(dragTime);
+}
+
+// ----- Ride logger -----
+String ridePath(uint16_t id) {
+  char buf[20];
+  snprintf(buf, sizeof(buf), "/r/%04u.bin", id);
+  return String(buf);
+}
+
+size_t totalRideBytes() {
+  size_t total = 0;
+  fs::File root = LittleFS.open("/r");
+  if (!root || !root.isDirectory()) {
+    return 0;
+  }
+  fs::File f = root.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      total += f.size();
+    }
+    f = root.openNextFile();
+  }
+  return total;
+}
+
+bool deleteOldestRide() {
+  int oldest = -1;
+  fs::File root = LittleFS.open("/r");
+  if (!root || !root.isDirectory()) {
+    return false;
+  }
+  fs::File f = root.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String name = f.name();
+      int slash = name.lastIndexOf('/');
+      if (slash >= 0) {
+        name = name.substring(slash + 1);
+      }
+      int id = name.toInt();
+      if (id > 0 && id != (int)currentRideId && (oldest < 0 || id < oldest)) {
+        oldest = id;
+      }
+    }
+    f = root.openNextFile();
+  }
+  if (oldest < 0) {
+    return false;
+  }
+  String path = ridePath((uint16_t)oldest);
+  if (LittleFS.remove(path)) {
+    logPrint("Ride logger: deleted oldest " + path);
+    return true;
+  }
+  return false;
+}
+
+void enforceRideBudget(size_t extraBytes) {
+  while (totalRideBytes() + extraBytes > RIDE_BUDGET_BYTES) {
+    if (!deleteOldestRide()) {
+      break;
+    }
+  }
+}
+
+void flushLog() {
+  if (!rideLogging || rideBufCount == 0 || !rideFile) {
+    return;
+  }
+  size_t bytes = rideBufCount * sizeof(LogSample);
+  enforceRideBudget(bytes);
+  if (totalRideBytes() + bytes > RIDE_BUDGET_BYTES) {
+    logPrint("Ride logger: budget full, dropping samples");
+    rideBufCount = 0;
+    return;
+  }
+  size_t written = rideFile.write((uint8_t *)rideBuf, bytes);
+  rideFile.flush();
+  if (written != bytes) {
+    logPrint("Ride logger: short write");
+  }
+  rideBufCount = 0;
+}
+
+void logSample() {
+  if (!rideLogging) {
+    return;
+  }
+  LogSample s;
+  float pressBar = usePSI ? (pressVal / 14.5038f) : pressVal;
+  long tempC = useImperial ? (long)round((tempVal - 32) * 5.0 / 9.0) : tempVal;
+  long speedKmh = (speedVal < 0) ? -1 : (useImperial ? (long)round(speedVal * 1.60934) : speedVal);
+  s.press_x100 = (int16_t)round(pressBar * 100.0f);
+  s.temp_c = (int16_t)tempC;
+  s.speed_kmh = (int16_t)speedKmh;
+  rideBuf[rideBufCount++] = s;
+  if (rideBufCount >= RIDE_BUF_SAMPLES) {
+    flushLog();
+  }
+}
+
+void setupLogger() {
+  if (!LittleFS.begin(true)) {
+    logPrint("LittleFS mount failed");
+    rideLogging = false;
+    return;
+  }
+  if (!LittleFS.exists("/r")) {
+    LittleFS.mkdir("/r");
+  }
+  if (!LittleFS.exists("/index.html")) {
+    logPrint("WARNING: /index.html missing — run: pio run -t uploadfs");
+  }
+  if (!LittleFS.exists("/live.html")) {
+    logPrint("WARNING: /live.html missing — run: pio run -t uploadfs");
+  }
+
+  preferences.begin("settings", false);
+  currentRideId = preferences.getUShort("rideSeq", 0) + 1;
+  if (currentRideId == 0) {
+    currentRideId = 1;
+  }
+  preferences.putUShort("rideSeq", currentRideId);
+  preferences.end();
+
+  String path = ridePath(currentRideId);
+  enforceRideBudget(0);
+  rideFile = LittleFS.open(path, "a");
+  if (!rideFile) {
+    logPrint("Ride logger: failed to open " + path);
+    rideLogging = false;
+    return;
+  }
+  rideBufCount = 0;
+  rideLogging = true;
+  logPrint("Ride logger: started " + path);
+}
+
+void showDragOverlay() {
+  if (!tftEnabled) {
+    return;
+  }
+  tft.fillScreen(TFT_BLACK);
+  tft.setFreeFont(FSS9);
+  tft.setTextPadding(0);
+  drawCenterText(120, 40, 1, TFT_WHITE, TFT_BLACK, useImperial ? "0-60 mph" : "0-100 km/h");
+  if (dragShowNewBest) {
+    drawCenterText(120, 70, 1, TFT_GREEN, TFT_BLACK, "NEW BEST!");
+  }
+  drawCenterText(120, 110, 1, TFT_LIGHTGREY, TFT_BLACK, "This run");
+  tft.setFreeFont(FSSB24);
+  drawCenterText(120, 145, 1, TFT_WHITE, TFT_BLACK, formatDragMs(dragShowCurrent));
+  tft.setFreeFont(FSS9);
+  drawCenterText(120, 185, 1, TFT_LIGHTGREY, TFT_BLACK, "Best: " + formatDragMs(dragShowBest));
+}
+
+void clearDragOverlayAndResume() {
+  dragShowUntil = 0;
+  if (!tftEnabled) {
+    invalidateGaugeCaches();
+    return;
+  }
+  tft.fillScreen(TFT_BLACK);
+  drawUI();
+  invalidateGaugeCaches();
+}
 
 // ----- Display draw stuff -----
 //Draw test with center alignment
@@ -259,6 +491,19 @@ void setOutputPress(bool val) { //true to ground with invert off
       }
     }
     lastOPval = val;
+  }
+}
+
+// Alarm IO when TFT draws are skipped (display off / drag overlay)
+void updateAlarmOutputs() {
+  bool tempAlarm = tempVal > alarmTemp;
+  bool pressAlarm = pressVal < alarmPress;
+  setOutputPress(pressAlarm);
+  static unsigned long lastBuzzSec = 0;
+  unsigned long sec = millis() / 1000;
+  if ((tempAlarm || pressAlarm) && buzzerEna && millis() > 10000 && (sec % 2) == 0 && lastBuzzSec != sec) {
+    lastBuzzSec = sec;
+    tone(buzzerOutput, 4000, 1000);
   }
 }
 
@@ -414,7 +659,6 @@ void drawPress(float val, bool PSI) {
 }
 
 //Draw G-force GUI to display
-int lastDot[2] = {0,0};
 void drawG(float fG, float sG) {
   tft.fillCircle(lastDot[0],lastDot[1], 5, TFT_BLACK);
   tft.drawCircle(175, 175, 30, TFT_WHITE);
@@ -427,7 +671,6 @@ void drawG(float fG, float sG) {
 // ----- Combined sensors funcs -----
 // ----- Temperature Sensor on ADS1115 Channel 0 -----
 long getTemp(bool imper) {
-  // V_out = V_supply * (R_sensor / (R_sensor + R_pullup))
   float sensorResistance = pullupResistor / (supplyVoltage / ads.computeVolts(ads.readADC_SingleEnded(0)) - 1);
   //Interpolate & return temperature from the resistance value
   float sensorTemperature = interpolateTemperature(sensorResistance);
@@ -471,9 +714,94 @@ void saveSettings() {
   preferences.putBool("uPSI",usePSI);
   preferences.putBool("invrt",invertOutput);
   preferences.putBool("eBuzz",buzzerEna);
+  preferences.putBool("eDrag",dragEna);
+  preferences.putBool("tftOn",tftEnabled);
   preferences.putInt("bright",bright);
   preferences.putULong("dragTime",dragTime);
   preferences.end();
+}
+
+String settingsToJson() {
+  String j = "{";
+  j += "\"aTemp\":" + String(alarmTemp) + ",";
+  j += "\"aPress\":" + String(alarmPress, 1) + ",";
+  j += "\"uImp\":" + String(useImperial ? "true" : "false") + ",";
+  j += "\"uPSI\":" + String(usePSI ? "true" : "false") + ",";
+  j += "\"invrt\":" + String(invertOutput ? "true" : "false") + ",";
+  j += "\"eBuzz\":" + String(buzzerEna ? "true" : "false") + ",";
+  j += "\"eDrag\":" + String(dragEna ? "true" : "false") + ",";
+  j += "\"tftOn\":" + String(tftEnabled ? "true" : "false") + ",";
+  j += "\"bright\":" + String(bright) + ",";
+  j += "\"dragTime\":" + String(dragTime);
+  j += "}";
+  return j;
+}
+
+String liveToJson() {
+  bool tempAlarm = tempVal > alarmTemp;
+  bool pressAlarm = pressVal < alarmPress;
+  bool dragShow = dragShowUntil != 0;
+  String j = "{";
+  j += "\"temp\":" + String(tempVal) + ",";
+  if (usePSI) {
+    j += "\"press\":" + String(pressVal, 0) + ",";
+  } else {
+    j += "\"press\":" + String(pressVal, 1) + ",";
+  }
+  j += "\"speed\":" + String(speedVal) + ",";
+  j += "\"gpsOk\":" + String(gpsReady ? "true" : "false") + ",";
+  j += "\"fG\":" + String(fG, 3) + ",";
+  j += "\"sG\":" + String(sG, 3) + ",";
+  j += "\"aTemp\":" + String(alarmTemp) + ",";
+  j += "\"aPress\":" + String(alarmPress, 1) + ",";
+  j += "\"uImp\":" + String(useImperial ? "true" : "false") + ",";
+  j += "\"uPSI\":" + String(usePSI ? "true" : "false") + ",";
+  j += "\"tempAlarm\":" + String(tempAlarm ? "true" : "false") + ",";
+  j += "\"pressAlarm\":" + String(pressAlarm ? "true" : "false") + ",";
+  j += "\"drag\":{";
+  j += "\"show\":" + String(dragShow ? "true" : "false") + ",";
+  j += "\"title\":\"" + String(useImperial ? "0-60 mph" : "0-100 km/h") + "\",";
+  j += "\"currentMs\":" + String(dragShowCurrent) + ",";
+  j += "\"bestMs\":" + String(dragShowBest) + ",";
+  j += "\"newBest\":" + String(dragShowNewBest ? "true" : "false");
+  j += "}";
+  j += "}";
+  return j;
+}
+
+String ridesToJson() {
+  String j = "[";
+  bool first = true;
+  fs::File root = LittleFS.open("/r");
+  if (root && root.isDirectory()) {
+    fs::File f = root.openNextFile();
+    while (f) {
+      if (!f.isDirectory()) {
+        String name = f.name();
+        int slash = name.lastIndexOf('/');
+        if (slash >= 0) {
+          name = name.substring(slash + 1);
+        }
+        int id = name.toInt();
+        size_t bytes = f.size();
+        size_t samples = bytes / sizeof(LogSample);
+        float durationSec = samples * (LOG_SAMPLE_MS / 1000.0f);
+        if (!first) {
+          j += ",";
+        }
+        first = false;
+        j += "{\"id\":" + String(id);
+        j += ",\"samples\":" + String(samples);
+        j += ",\"durationSec\":" + String(durationSec, 1);
+        j += ",\"bytes\":" + String(bytes);
+        j += ",\"current\":" + String(id == (int)currentRideId ? "true" : "false");
+        j += "}";
+      }
+      f = root.openNextFile();
+    }
+  }
+  j += "]";
+  return j;
 }
 
 void setupWebServer() {
@@ -487,8 +815,100 @@ void setupWebServer() {
   WiFi.softAP(otaSSID, otaPassword);
   logPrint("WiFi AP started: " + String(otaSSID) + " @ " + WiFi.softAPIP().toString());
 
+  ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+    if (type == WS_EVT_CONNECT) {
+      client->text(liveToJson());
+    } else if (type == WS_EVT_DISCONNECT) { }
+  });
+  server.addHandler(&ws);
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(LittleFS, "/index.html", "text/html");
+  });
+
+  server.on("/live", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(LittleFS, "/live.html", "text/html");
+  });
+
   server.on("/log", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/plain", logBuffer ? logBuffer : "(log buffer not allocated)");
+  });
+
+  server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", settingsToJson());
+  });
+
+  server.on("/api/live", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", liveToJson());
+  });
+
+  server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("aTemp", true))
+      alarmTemp = request->getParam("aTemp", true)->value().toInt();
+    if (request->hasParam("aPress", true))
+      alarmPress = request->getParam("aPress", true)->value().toFloat();
+    if (request->hasParam("uImp", true))
+      useImperial = request->getParam("uImp", true)->value() == "1" || request->getParam("uImp", true)->value() == "true";
+    if (request->hasParam("uPSI", true))
+      usePSI = request->getParam("uPSI", true)->value() == "1" || request->getParam("uPSI", true)->value() == "true";
+    if (request->hasParam("invrt", true))
+      invertOutput = request->getParam("invrt", true)->value() == "1" || request->getParam("invrt", true)->value() == "true";
+    if (request->hasParam("eBuzz", true))
+      buzzerEna = request->getParam("eBuzz", true)->value() == "1" || request->getParam("eBuzz", true)->value() == "true";
+    if (request->hasParam("eDrag", true))
+      dragEna = request->getParam("eDrag", true)->value() == "1" || request->getParam("eDrag", true)->value() == "true";
+    if (request->hasParam("tftOn", true)) {
+      bool next = request->getParam("tftOn", true)->value() == "1" || request->getParam("tftOn", true)->value() == "true";
+      if (next != tftEnabled) {
+        tftEnabled = next;
+        tftPowerPending = true;
+      }
+    }
+    if (request->hasParam("bright", true)) {
+      bright = constrain(request->getParam("bright", true)->value().toInt(), 2, 100);
+      if (tftEnabled) {
+        tftPowerPending = true;
+      }
+    }
+    saveSettings();
+    request->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/api/rides", HTTP_GET, [](AsyncWebServerRequest *request) {
+    flushLog();
+    request->send(200, "application/json", ridesToJson());
+  });
+
+  server.on("/api/ride", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("id")) {
+      request->send(400, "text/plain", "missing id");
+      return;
+    }
+    uint16_t id = (uint16_t)request->getParam("id")->value().toInt();
+    bool reopen = false;
+    if (id == currentRideId) {
+      flushLog();
+      if (rideFile) {
+        rideFile.close();
+        reopen = true;
+      }
+    }
+    String path = ridePath(id);
+    if (!LittleFS.exists(path)) {
+      if (reopen) {
+        rideFile = LittleFS.open(ridePath(currentRideId), "a");
+      }
+      request->send(404, "text/plain", "ride not found");
+      return;
+    }
+    request->send(LittleFS, path, "application/octet-stream");
+    if (reopen) {
+      rideFile = LittleFS.open(ridePath(currentRideId), "a");
+      if (!rideFile) {
+        rideLogging = false;
+        logPrint("Ride logger: failed to reopen after download");
+      }
+    }
   });
 
   ElegantOTA.begin(&server); //adds the /update page
@@ -531,22 +951,27 @@ void setup() {
   usePSI = preferences.getBool("uPSI",false);
   invertOutput = preferences.getBool("invrt",false);
   buzzerEna = preferences.getBool("eBuzz",false);
+  dragEna = preferences.getBool("eDrag",false);
   bright = preferences.getInt("bright",100);
   dragTime = preferences.getULong("dragTime",0);
+  tftEnabled = preferences.getBool("tftOn", true);
   preferences.end();
+  //Mount LittleFS + open this boot's ride log
+  setupLogger();
   //Brightness pin
   ledcAttach(BL_PIN, 25000, 8);
-  ledcWrite(BL_PIN, bright);
   //Init/configure gps
   setupGPS();
   //Init TFT
-  TFT_SET_BL(bright);
   tft.begin();
   tft.setRotation(2); //Adjust rotation if needed
+  applyTftPower();
   //Init ADC
   if (!ads.begin()) {
     logPrint("Failed to initialize ADS1115!");
-    drawCenterText(120, 120, 1, TFT_WHITE, TFT_BLACK, "ADC ERROR");
+    if (tftEnabled) {
+      drawCenterText(120, 120, 1, TFT_WHITE, TFT_BLACK, "ADC ERROR");
+    }
     while (1); //Halt if initialization fails
   } else {
     ads.setGain(GAIN_TWOTHIRDS);
@@ -556,11 +981,20 @@ void setup() {
   if(myIMU.begin()) {
     logPrint("[E] An Error has occurred while connecting to LSM!");
   }
-  drawUI();
+  if (tftEnabled) {
+    drawUI();
+  }
+  logupdate = millis();
+  valupdate = millis();
 }
 
 void loop(void) {
   ElegantOTA.loop(); //services pending OTA update/reboot requests
+
+  if (tftPowerPending) {
+    tftPowerPending = false;
+    applyTftPower();
+  }
 
   //Feed gps
   while(Serial1.available() > 0) {
@@ -573,20 +1007,30 @@ void loop(void) {
     }
   }
 
-  if(gpsReady && dragEna) {
+  // Clear drag overlay after 5s and resume gauges
+  if (dragShowUntil != 0 && (long)(millis() - dragShowUntil) >= 0) {
+    clearDragOverlayAndResume();
+  }
+
+  if(gpsReady && dragEna && dragShowUntil == 0) {
     DnowSpeed = gps.speed.kmph();
     if(DlastSpeed < 2 && DnowSpeed >= 2 && dragStart == 0) {
       dragStart = millis();
     }
     if(dragStart != 0 && ((useImperial)?(DnowSpeed>=60):(DnowSpeed>=100))) {
       unsigned long currentDrag = millis()-dragStart;
-      if(currentDrag < dragTime) {
-        dragTime = currentDrag;
+      bool isNewBest = (dragTime == 0 || currentDrag < dragTime);
+      if(isNewBest) {
+        dragTime = (uint16_t)currentDrag;
         preferences.begin("settings", false);
         preferences.putULong("dragTime",dragTime);
         preferences.end();
       }
-      //display currentDrag & best //new best! for x amount before clearing and redrawing
+      dragShowCurrent = currentDrag;
+      dragShowBest = dragTime;
+      dragShowNewBest = isNewBest;
+      dragShowUntil = millis() + 5000;
+      showDragOverlay();
       dragStart = 0;
     }
     if (dragStart != 0 && (millis()-dragStart) > 30000) {
@@ -595,29 +1039,41 @@ void loop(void) {
     DlastSpeed = DnowSpeed;
   }
 
-  //Update values every 100ms
+  //Update values every 100ms (skip gauge draws while drag result is on screen or TFT off)
   if((millis()-valupdate)>100) {
-    //unsigned long drawTime = millis();
     tempVal = getTemp(useImperial);
     pressVal = round(getPress(usePSI) * 10) / 10.0;
     speedVal = getSpeed(useImperial);
     fG = myIMU.readFloatAccelZ();
     sG = myIMU.readFloatAccelX();
-    drawG(fG,sG);
-    drawTemp(tempVal,useImperial);
-    drawPress(pressVal,usePSI);
-    drawSpeed(speedVal);
-    /*Serial.println("Temp: "+String(tempVal));
-    Serial.println("Press: "+String(pressVal,2));
-    Serial.println("Speed: "+String(speedVal));
-    Serial.println("Sats.: "+String(gps.satellites.value()));
-    Serial.println("------------");*/
-    hue = (hue + 1) % 256;
-    color = hsvToRgb(hue);
-    tft.drawFastHLine(0, 120, 240, color);
-    tft.drawFastVLine(120, 18, 222, color);
-    //Serial.println(">T:"+String(millis()-drawTime));
+    if (tftEnabled && dragShowUntil == 0) {
+      drawG(fG,sG);
+      drawTemp(tempVal,useImperial);
+      drawPress(pressVal,usePSI);
+      drawSpeed(speedVal);
+      hue = (hue + 1) % 256;
+      color = hsvToRgb(hue);
+      tft.drawFastHLine(0, 120, 240, color);
+      tft.drawFastVLine(120, 18, 222, color);
+    } else if (!tftEnabled) {
+      updateAlarmOutputs();
+    }
+    if (ws.count() > 0) {
+      ws.textAll(liveToJson());
+    }
+    ws.cleanupClients();
     valupdate = millis();
+  }
+
+  //Log SI samples every 0.5s; flush buffer about every 8s
+  if ((millis() - logupdate) >= LOG_SAMPLE_MS) {
+    logSample();
+    static uint8_t flushTicks = 0;
+    if (++flushTicks >= 16) { // 16 * 0.5s = 8s
+      flushLog();
+      flushTicks = 0;
+    }
+    logupdate = millis();
   }
 
   //Settings menu
@@ -625,6 +1081,9 @@ void loop(void) {
     bool loopVar = true, drawRun = true;
     unsigned long debounce = 0;
     int currentMenu = 0, textSide = 75, valueSide = 185, paddValue = 50, paddText = 142, downAmnt = 65;
+    if (!tftEnabled) {
+      TFT_SET_BL((uint8_t)bright); //temporarily light so menu is visible
+    }
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setFreeFont(FSS9);
@@ -880,13 +1339,7 @@ void loop(void) {
         }
       }
     }
-    tft.fillScreen(TFT_BLACK); //Force functions to draw again
-    drawUI();
-    lastTemp = -2;
-    lastPress = -2;
-    lastSpeed = -2;
-    colorTemp = TFT_RED;
-    colorPress = TFT_RED;
-    TFT_SET_BL(bright);
+    invalidateGaugeCaches();
+    applyTftPower();
   }
 }

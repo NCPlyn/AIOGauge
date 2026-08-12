@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>AIOGauge Live</title>
+<style>
+  :root { --bg:#0a0a0a; --fg:#eee; --muted:#9a9a9a; --line:#2a2a2a; --alarm:#b01010; --ok:#1a1a1a; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family:system-ui,sans-serif; overflow:hidden; }
+  .top {
+    position:absolute; top:0; left:0; right:0; z-index:5;
+    display:flex; align-items:center; justify-content:space-between;
+    padding:8px 12px; pointer-events:none;
+  }
+  .top a {
+    pointer-events:auto; color:#fff; background:#333; text-decoration:none;
+    padding:8px 12px; border-radius:6px; font-size:.9rem;
+  }
+  #status { font-size:.8rem; color:var(--muted); pointer-events:none; }
+  #status.ok { color:#3a7; }
+  #status.err { color:#f66; }
+  .grid {
+    position:absolute; inset:0;
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    grid-template-rows:1fr 1fr;
+  }
+  .quad {
+    position:relative;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    background:var(--ok);
+    min-height:0; min-width:0;
+    padding:12px;
+  }
+  .quad.alarm { background:var(--alarm); }
+  .label { font-size:clamp(.9rem, 2.8vw, 1.2rem); color:var(--muted); letter-spacing:.04em; text-transform:uppercase; }
+  .quad.alarm .label { color:#f0d0d0; }
+  .value {
+    font-size:clamp(2.8rem, 14vw, 6.5rem);
+    font-weight:700; line-height:1.05; margin:6px 0;
+    font-variant-numeric:tabular-nums;
+  }
+  .unit { font-size:clamp(.85rem, 2.5vw, 1.1rem); color:var(--muted); }
+  .quad.alarm .unit { color:#f0d0d0; }
+  #gCanvas { width:min(42vw, 42vh); height:min(42vw, 42vh); max-width:100%; max-height:70%; }
+  .crossh, .crossv {
+    position:absolute; z-index:2; pointer-events:none;
+    background:hsl(0, 90%, 55%);
+  }
+  .crossh { left:0; right:0; top:50%; height:2px; transform:translateY(-50%); }
+  .crossv { top:0; bottom:0; left:50%; width:2px; transform:translateX(-50%); }
+  #drag {
+    display:none; position:absolute; inset:0; z-index:10;
+    background:#000; flex-direction:column; align-items:center; justify-content:center;
+    text-align:center; padding:24px;
+  }
+  #drag.show { display:flex; }
+  #drag .title { font-size:clamp(1.2rem, 4vw, 2rem); margin-bottom:8px; }
+  #drag .newbest { color:#3d3; font-size:clamp(1rem, 3.5vw, 1.6rem); min-height:1.4em; }
+  #drag .sub { color:var(--muted); margin-top:16px; }
+  #drag .time { font-size:clamp(2.5rem, 12vw, 5rem); font-weight:700; margin:8px 0; }
+  #drag .best { color:var(--muted); font-size:clamp(1rem, 3vw, 1.4rem); margin-top:12px; }
+</style>
+</head>
+<body>
+  <div class="top">
+    <a href="/">Settings</a>
+    <span id="status">Connecting…</span>
+  </div>
+
+  <div class="grid" id="grid">
+    <div class="quad" id="qTemp">
+      <div class="label">Temp</div>
+      <div class="value" id="vTemp">—</div>
+      <div class="unit" id="uTemp">°C</div>
+    </div>
+    <div class="quad" id="qPress">
+      <div class="label">Press</div>
+      <div class="value" id="vPress">—</div>
+      <div class="unit" id="uPress">bar</div>
+    </div>
+    <div class="quad" id="qSpeed">
+      <div class="label">Speed</div>
+      <div class="value" id="vSpeed">—</div>
+      <div class="unit" id="uSpeed">km/h</div>
+    </div>
+    <div class="quad" id="qG">
+      <div class="label">G</div>
+      <canvas id="gCanvas" width="240" height="240"></canvas>
+    </div>
+  </div>
+  <div class="crossh" id="crossh"></div>
+  <div class="crossv" id="crossv"></div>
+
+  <div id="drag">
+    <div class="title" id="dragTitle">0-100 km/h</div>
+    <div class="newbest" id="dragNew"></div>
+    <div class="sub">This run</div>
+    <div class="time" id="dragCurrent">—</div>
+    <div class="best" id="dragBest">Best: —</div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let live = null;
+let hue = 0;
+let ws = null;
+let pollTimer = null;
+let reconnectDelay = 500;
+
+function formatDragMs(ms) {
+  ms = Number(ms) || 0;
+  if (ms <= 0) return 'None';
+  const seconds = Math.floor(ms / 1000);
+  const decimal = Math.floor((ms % 1000) / 10);
+  return seconds + '.' + String(decimal).padStart(2, '0') + 's';
+}
+
+function setStatus(text, cls) {
+  const el = $('status');
+  el.textContent = text;
+  el.className = cls || '';
+}
+
+function applyLive(data) {
+  live = data;
+  const blink = Math.floor(Date.now() / 1000) % 2 === 0;
+
+  $('uTemp').textContent = data.uImp ? '°F' : '°C';
+  $('uPress').textContent = data.uPSI ? 'PSI' : 'bar';
+  $('uSpeed').textContent = data.uImp ? 'mph' : 'km/h';
+
+  $('vTemp').textContent = String(data.temp);
+  $('vPress').textContent = data.uPSI ? String(Math.round(data.press)) : Number(data.press).toFixed(1);
+  if (data.gpsOk && data.speed >= 0) {
+    $('vSpeed').textContent = String(data.speed);
+  } else {
+    $('vSpeed').textContent = '###';
+  }
+
+  $('qTemp').classList.toggle('alarm', !!data.tempAlarm && blink);
+  $('qPress').classList.toggle('alarm', !!data.pressAlarm && blink);
+
+  drawG(data.fG, data.sG);
+
+  const drag = data.drag || {};
+  const overlay = $('drag');
+  if (drag.show) {
+    overlay.classList.add('show');
+    $('dragTitle').textContent = drag.title || (data.uImp ? '0-60 mph' : '0-100 km/h');
+    $('dragNew').textContent = drag.newBest ? 'NEW BEST!' : '';
+    $('dragCurrent').textContent = formatDragMs(drag.currentMs);
+    $('dragBest').textContent = 'Best: ' + formatDragMs(drag.bestMs);
+  } else {
+    overlay.classList.remove('show');
+  }
+}
+
+function drawG(fG, sG) {
+  const canvas = $('gCanvas');
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width;
+  const h = canvas.height;
+  const cx = w / 2;
+  const cy = h / 2;
+  const rOuter = Math.min(w, h) * 0.38;
+  const rInner = rOuter * 0.53;
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(cx, cy, rOuter, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, cy, rInner, 0, Math.PI * 2); ctx.stroke();
+  const clamp = (v) => Math.max(-1, Math.min(1, Number(v) || 0));
+  const dx = clamp(sG) * rOuter;
+  const dy = clamp(fG) * rOuter;
+  ctx.fillStyle = '#e22';
+  ctx.beginPath();
+  ctx.arc(cx + dx, cy + dy, Math.max(6, rOuter * 0.12), 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function animateHue() {
+  hue = (hue + 1) % 360;
+  const color = 'hsl(' + hue + ', 90%, 55%)';
+  $('crossh').style.background = color;
+  $('crossv').style.background = color;
+  if (live) {
+    const blink = Math.floor(Date.now() / 1000) % 2 === 0;
+    $('qTemp').classList.toggle('alarm', !!live.tempAlarm && blink);
+    $('qPress').classList.toggle('alarm', !!live.pressAlarm && blink);
+  }
+  requestAnimationFrame(animateHue);
+}
+
+async function pollOnce() {
+  try {
+    const r = await fetch('/api/live');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    applyLive(await r.json());
+    setStatus('Polling', 'ok');
+  } catch (e) {
+    setStatus('Offline', 'err');
+  }
+}
+
+function startPoll() {
+  if (pollTimer) return;
+  pollOnce();
+  pollTimer = setInterval(pollOnce, 100);
+}
+
+function stopPoll() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function connectWs() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = proto + '//' + location.host + '/ws';
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    setStatus('WS failed', 'err');
+    startPoll();
+    return;
+  }
+  ws.onopen = () => {
+    reconnectDelay = 500;
+    stopPoll();
+    setStatus('Live', 'ok');
+  };
+  ws.onmessage = (ev) => {
+    try {
+      applyLive(JSON.parse(ev.data));
+    } catch (_) {}
+  };
+  ws.onerror = () => {
+    setStatus('WS error', 'err');
+  };
+  ws.onclose = () => {
+    setStatus('Reconnecting…', 'err');
+    startPoll();
+    setTimeout(connectWs, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 1.5, 5000);
+  };
+}
+
+connectWs();
+requestAnimationFrame(animateHue);
+</script>
+</body>
+</html>

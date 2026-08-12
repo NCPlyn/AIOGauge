@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AIOGauge</title>
+<style>
+  :root { --bg:#111; --fg:#eee; --muted:#999; --acc:#3a7; --line:#333; --card:#1a1a1a; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.4 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:720px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.8rem; margin:0 0 12px; }
+  h2 { font-size:1.1rem; margin:24px 0 10px; border-bottom:1px solid var(--line); padding-bottom:6px; }
+  .nav { display:flex; justify-content:center; gap:10px; margin-bottom:16px; }
+  .nav a {
+    display:inline-block; padding:12px 28px; min-width:100px; text-align:center;
+    background:#444; color:#fff; text-decoration:none; border:0; border-radius:6px; font:inherit;
+  }
+  button {
+    display:inline-block; padding:10px 14px; background:var(--acc); color:#fff;
+    text-decoration:none; border:0; border-radius:6px; cursor:pointer; font:inherit;
+  }
+  button.secondary { background:#444; }
+  button:disabled { opacity:.5; }
+  .settings { background:var(--card); padding:14px; border-radius:8px; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 0; border-bottom:1px solid var(--line); }
+  .row:last-child { border-bottom:0; }
+  label { color:var(--muted); }
+  input[type=number] { width:90px; padding:6px; background:#000; color:var(--fg); border:1px solid var(--line); border-radius:4px; }
+  input[type=checkbox] { width:18px; height:18px; }
+  .actions { margin-top:12px; display:flex; gap:8px; align-items:center; }
+  #saveMsg { color:var(--acc); font-size:.9rem; }
+  .graph-controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:center; margin-bottom:10px; }
+  select { padding:8px; background:#000; color:var(--fg); border:1px solid var(--line); border-radius:4px; min-width:160px; }
+  canvas { width:100%; max-width:100%; background:#000; border:1px solid var(--line); border-radius:8px; touch-action:none; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; margin-top:8px; color:var(--muted); font-size:.9rem; }
+  .legend span::before { content:""; display:inline-block; width:12px; height:3px; margin-right:6px; vertical-align:middle; }
+  .lg-temp::before { background:#f66; }
+  .lg-press::before { background:#6cf; }
+  .lg-speed::before { background:#6f6; }
+  .err { color:#f66; }
+</style>
+</head>
+<body>
+<main>
+  <div style="text-align:center;">
+    <h1>AIOGauge</h1>
+  </div>
+  <div class="nav">
+    <a href="/live">Live</a>
+    <a href="/log">Logs</a>
+    <a href="/update">OTA</a>
+  </div>
+
+  <h2>Settings</h2>
+  <div class="settings" id="settings">
+    <div class="row"><label for="aTemp">Temp alarm</label><input id="aTemp" type="number" step="1"></div>
+    <div class="row"><label for="aPress">Press alarm</label><input id="aPress" type="number" step="0.1"></div>
+    <div class="row"><label for="uPSI">Use PSI</label><input id="uPSI" type="checkbox"></div>
+    <div class="row"><label for="uImp">Use imperial</label><input id="uImp" type="checkbox"></div>
+    <div class="row"><label for="invrt">Invert output</label><input id="invrt" type="checkbox"></div>
+    <div class="row"><label for="eBuzz">Alarm buzzer</label><input id="eBuzz" type="checkbox"></div>
+    <div class="row"><label for="eDrag">Drag mode</label><input id="eDrag" type="checkbox"></div>
+    <div class="row"><label for="tftOn">TFT display</label><input id="tftOn" type="checkbox"></div>
+    <div class="row"><label for="bright">Brightness</label><input id="bright" type="number" min="2" max="100" step="2"></div>
+    <div class="actions">
+      <button id="saveBtn" type="button">Save</button>
+      <span id="saveMsg"></span>
+    </div>
+  </div>
+
+  <h2>Ride graph</h2>
+  <div class="graph-controls">
+    <select id="rideSelect"><option value="">Loading…</option></select>
+    <label><input id="showTemp" type="checkbox" checked> Temp</label>
+    <label><input id="showPress" type="checkbox" checked> Press</label>
+    <label><input id="showSpeed" type="checkbox" checked> Speed</label>
+    <button class="secondary" id="reloadRides" type="button">Reload</button>
+  </div>
+  <canvas id="chart" width="720" height="320"></canvas>
+  <div class="legend">
+    <span class="lg-temp" id="legTemp">Temp</span>
+    <span class="lg-press" id="legPress">Press</span>
+    <span class="lg-speed" id="legSpeed">Speed</span>
+  </div>
+  <p id="graphMsg" class="err"></p>
+</main>
+<script>
+const SAMPLE_DT = 0.5;
+let settings = {};
+let samples = []; // {t, tempC, pressBar, speedKmh}
+
+function $(id) { return document.getElementById(id); }
+
+async function loadSettings() {
+  const r = await fetch('/api/settings');
+  settings = await r.json();
+  $('aTemp').value = settings.aTemp;
+  $('aPress').value = settings.aPress;
+  $('uImp').checked = !!settings.uImp;
+  $('uPSI').checked = !!settings.uPSI;
+  $('invrt').checked = !!settings.invrt;
+  $('eBuzz').checked = !!settings.eBuzz;
+  $('eDrag').checked = !!settings.eDrag;
+  $('tftOn').checked = settings.tftOn !== false;
+  $('bright').value = settings.bright;
+  updateLegendUnits();
+}
+
+async function saveSettings() {
+  const body = new URLSearchParams();
+  body.set('aTemp', $('aTemp').value);
+  body.set('aPress', $('aPress').value);
+  body.set('uImp', $('uImp').checked ? 'true' : 'false');
+  body.set('uPSI', $('uPSI').checked ? 'true' : 'false');
+  body.set('invrt', $('invrt').checked ? 'true' : 'false');
+  body.set('eBuzz', $('eBuzz').checked ? 'true' : 'false');
+  body.set('eDrag', $('eDrag').checked ? 'true' : 'false');
+  body.set('tftOn', $('tftOn').checked ? 'true' : 'false');
+  body.set('bright', $('bright').value);
+  const r = await fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString()
+  });
+  $('saveMsg').textContent = r.ok ? 'Saved' : 'Save failed';
+  if (r.ok) {
+    settings.aTemp = Number($('aTemp').value);
+    settings.aPress = Number($('aPress').value);
+    settings.uImp = $('uImp').checked;
+    settings.uPSI = $('uPSI').checked;
+    updateLegendUnits();
+    drawChart();
+    setTimeout(() => { $('saveMsg').textContent = ''; }, 2000);
+  }
+}
+
+function updateLegendUnits() {
+  const tUnit = settings.uImp ? '°F' : '°C';
+  const pUnit = settings.uPSI ? 'PSI' : 'bar';
+  const sUnit = settings.uImp ? 'mph' : 'km/h';
+  $('legTemp').textContent = 'Temp (' + tUnit + ')';
+  $('legPress').textContent = 'Press (' + pUnit + ')';
+  $('legSpeed').textContent = 'Speed (' + sUnit + ')';
+}
+
+function toDisplay(s) {
+  const temp = settings.uImp ? (s.tempC * 9 / 5 + 32) : s.tempC;
+  const press = settings.uPSI ? (s.pressBar * 14.5038) : s.pressBar;
+  const speed = s.speedKmh < 0 ? null : (settings.uImp ? s.speedKmh / 1.60934 : s.speedKmh);
+  return { t: s.t, temp, press, speed };
+}
+
+async function loadRides() {
+  const sel = $('rideSelect');
+  sel.innerHTML = '';
+  try {
+    const r = await fetch('/api/rides');
+    const rides = await r.json();
+    rides.sort((a, b) => b.id - a.id);
+    if (!rides.length) {
+      sel.innerHTML = '<option value="">No rides</option>';
+      samples = [];
+      drawChart();
+      return;
+    }
+    for (const ride of rides) {
+      const opt = document.createElement('option');
+      opt.value = ride.id;
+      const mins = (ride.durationSec / 60).toFixed(1);
+      opt.textContent = 'Ride #' + ride.id + (ride.current ? ' (current)' : '') +
+        ' — ' + mins + ' min, ' + ride.samples + ' samples';
+      sel.appendChild(opt);
+    }
+    await loadRide(sel.value);
+  } catch (e) {
+    sel.innerHTML = '<option value="">Failed to load</option>';
+    $('graphMsg').textContent = String(e);
+  }
+}
+
+async function loadRide(id) {
+  $('graphMsg').textContent = '';
+  samples = [];
+  if (!id) { drawChart(); return; }
+  try {
+    const r = await fetch('/api/ride?id=' + encodeURIComponent(id));
+    if (!r.ok) throw new Error('Ride ' + id + ' not found');
+    const buf = await r.arrayBuffer();
+    const view = new DataView(buf);
+    const n = Math.floor(buf.byteLength / 6);
+    for (let i = 0; i < n; i++) {
+      const o = i * 6;
+      samples.push({
+        t: i * SAMPLE_DT,
+        pressBar: view.getInt16(o, true) / 100,
+        tempC: view.getInt16(o + 2, true),
+        speedKmh: view.getInt16(o + 4, true)
+      });
+    }
+    drawChart();
+  } catch (e) {
+    $('graphMsg').textContent = String(e);
+    drawChart();
+  }
+}
+
+function drawChart() {
+  const canvas = $('chart');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  const showT = $('showTemp').checked;
+  const showP = $('showPress').checked;
+  const showS = $('showSpeed').checked;
+  if (!samples.length || (!showT && !showP && !showS)) {
+    ctx.fillStyle = '#666';
+    ctx.font = '14px sans-serif';
+    ctx.fillText('No data', 20, 30);
+    return;
+  }
+
+  const pts = samples.map(toDisplay);
+  const axisW = 44;
+  const leftAxes = (showT ? 1 : 0);
+  const rightAxes = (showP ? 1 : 0) + (showS ? 1 : 0);
+  const padL = 8 + leftAxes * axisW;
+  const padR = 8 + rightAxes * axisW;
+  const padT = 16, padB = 36;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const tMax = Math.max(pts[pts.length - 1].t, 1);
+  const alarmTempDisp = Number(settings.aTemp);
+  const alarmPressDisp = Number(settings.aPress);
+
+  function makeScale(getter, extra) {
+    let lo = Infinity, hi = -Infinity;
+    for (const p of pts) {
+      const v = getter(p);
+      if (v == null || !isFinite(v)) continue;
+      lo = Math.min(lo, v);
+      hi = Math.max(hi, v);
+    }
+    if (extra != null && isFinite(extra)) {
+      lo = Math.min(lo, extra);
+      hi = Math.max(hi, extra);
+    }
+    if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
+    if (hi === lo) { hi += 1; lo -= 1; }
+    const pad = (hi - lo) * 0.08;
+    lo -= pad; hi += pad;
+    return {
+      lo, hi,
+      yOf: v => padT + plotH - ((v - lo) / (hi - lo)) * plotH
+    };
+  }
+
+  const scaleT = showT ? makeScale(p => p.temp, alarmTempDisp) : null;
+  const scaleP = showP ? makeScale(p => p.press, alarmPressDisp) : null;
+  const scaleS = showS ? makeScale(p => p.speed, null) : null;
+
+  const xOf = t => padL + (t / tMax) * plotW;
+
+  // Plot frame + time grid
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, padT + plotH);
+  ctx.lineTo(padL + plotW, padT + plotH);
+  ctx.lineTo(padL + plotW, padT);
+  ctx.closePath();
+  ctx.stroke();
+
+  ctx.font = '11px sans-serif';
+  for (let i = 0; i <= 4; i++) {
+    const t = (tMax * i) / 4;
+    const x = xOf(t);
+    ctx.strokeStyle = '#222';
+    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
+    ctx.fillStyle = '#888';
+    ctx.fillText(t.toFixed(0) + 's', x - 10, H - 12);
+  }
+
+  function drawAxis(scale, color, x, alignRight) {
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x, padT);
+    ctx.lineTo(x, padT + plotH);
+    ctx.stroke();
+    for (let i = 0; i <= 4; i++) {
+      const v = scale.lo + ((scale.hi - scale.lo) * (4 - i)) / 4;
+      const y = scale.yOf(v);
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(alignRight ? x + 5 : x - 5, y);
+      ctx.stroke();
+      const label = Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1);
+      if (alignRight) {
+        ctx.textAlign = 'left';
+        ctx.fillText(label, x + 8, y + 3);
+      } else {
+        ctx.textAlign = 'right';
+        ctx.fillText(label, x - 8, y + 3);
+      }
+    }
+    ctx.textAlign = 'left';
+  }
+
+  let leftX = padL;
+  let rightSlot = 0;
+  if (scaleT) {
+    drawAxis(scaleT, '#f66', leftX, false);
+  }
+  if (scaleP) {
+    drawAxis(scaleP, '#6cf', padL + plotW + rightSlot * axisW, true);
+    rightSlot++;
+  }
+  if (scaleS) {
+    drawAxis(scaleS, '#6f6', padL + plotW + rightSlot * axisW, true);
+  }
+
+  function strokeSeries(scale, color, getter) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    for (const p of pts) {
+      const v = getter(p);
+      if (v == null || !isFinite(v)) { started = false; continue; }
+      const x = xOf(p.t), y = scale.yOf(v);
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  function drawAlarmLine(scale, value, color, label) {
+    if (!scale || !isFinite(value)) return;
+    const y = scale.yOf(value);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = color;
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(label, padL + 4, y - 4);
+  }
+
+  if (scaleT) {
+    strokeSeries(scaleT, '#f66', p => p.temp);
+    drawAlarmLine(scaleT, alarmTempDisp, '#f66', 'Temp alarm');
+  }
+  if (scaleP) {
+    strokeSeries(scaleP, '#6cf', p => p.press);
+    drawAlarmLine(scaleP, alarmPressDisp, '#6cf', 'Press alarm');
+  }
+  if (scaleS) strokeSeries(scaleS, '#6f6', p => p.speed);
+}
+
+$('saveBtn').addEventListener('click', saveSettings);
+$('reloadRides').addEventListener('click', loadRides);
+$('rideSelect').addEventListener('change', e => loadRide(e.target.value));
+['showTemp','showPress','showSpeed'].forEach(id => $(id).addEventListener('change', drawChart));
+['uImp','uPSI'].forEach(id => $(id).addEventListener('change', () => {
+  settings.uImp = $('uImp').checked;
+  settings.uPSI = $('uPSI').checked;
+  updateLegendUnits();
+  drawChart();
+}));
+['aTemp','aPress'].forEach(id => $(id).addEventListener('input', () => {
+  settings.aTemp = Number($('aTemp').value);
+  settings.aPress = Number($('aPress').value);
+  drawChart();
+}));
+
+loadSettings().then(loadRides).catch(e => { $('graphMsg').textContent = String(e); });
+</script>
+</body>
+</html>
