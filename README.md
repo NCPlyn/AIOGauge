@@ -5,12 +5,20 @@ All-In-One-Oil-Gauge; a ESP32S3 project that uses:
 - **LSM6DS3** accelerometer for G force realtime monitor
 - **ATGM336H** GPS for realtime speed monitor + 0-100km/h / 0-60mph 10Hz timer
 - **GC9A01** round TFT display shows all information
-- Setup configuration via two buttons
-- **WiFi** to update firmware (TBD settings, long time logging etc...)
+- **Logs** last 10 hours of measurements to view later at 2Hz
+- **WiFi** to update the firmware, change settings, view logged graphs of values and have **live view** alongs side the display!
+- Two buttons to edit setting on the device itself
+- **STLs** for 3D printed enclosure in /enclosure, screwed together with M3x16
 
 **Project in development**
 
 ## Photos
+
+<div style="display:flex">
+<img src="img/encl-front.jpg" alt="front" height="400">
+<img src="img/encl-back.jpg" alt="back" height="400">
+</div>
+*Finished gauge in 3D printed enclosure*
 
 ![Prototype PCB](img/pcbway-board.jpg)  
 *PCBWay provided & preassembled PCB*  

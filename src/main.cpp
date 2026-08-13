@@ -7,7 +7,6 @@ PCB fix:
 - louder buzzer/tranzistor
 - ESP32S3 without module + antenna (https://files.waveshare.com/wiki/ESP32-S3-Zero/ESP32-S3-Zero-Sch.pdf)
 - relocate gps to back?
-Design enclosure
 Write down sensor pinout to cable to PCB
 */
 
