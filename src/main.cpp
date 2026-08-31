@@ -13,6 +13,7 @@ Write down sensor pinout to cable to PCB
 // ----- User Settings ----- (350, loads that if not saved)
 int alarmTemp = 130; //above this temperature is alarm
 float alarmPress = 1.0; //below this pressure is alarm
+float pressSensMvPerBar = 400.0f; // PST-F 1 10 bar; web presets: 400 / 14.3 / 11.43
 bool useImperial = false; //true for imperial, false for metric
 bool usePSI = false; //true for PSI, false for bar
 bool invertOutput = false; //true for pressureOutput = normally floating
@@ -62,6 +63,9 @@ AsyncWebSocket ws("/ws");
 uint16_t colorTemp = 0x0000, colorPress = 0x0000, dragTime = 0, valupdate = 0, dragStart = 0, color;
 bool gpsReady = false, lastOPval = false;
 volatile bool tftPowerPending = false;
+#define GPS_CMD_MAX 128
+char gpsCmdBuf[GPS_CMD_MAX];
+volatile bool gpsCmdPending = false;
 long tempVal = 140, speedVal = 0, DnowSpeed = 0, DlastSpeed = 0, lastTemp = 0, bright = 100,lastSpeed = -10;
 float pressVal = 0, fG = -5.0, sG = -5.0, lastPress = 0;
 int lastDot[2] = {175, 175};
@@ -108,10 +112,11 @@ float temperatureTable[tableSize] = { -40, -30, -20, -10, 0, 10, 20, 30, 40, 50,
 float resistanceTable[tableSize]  = { 44864, 25524, 15067, 9195, 5784, 3740, 2480, 1683, 1167, 824, 594, 434.9, 323.4, 244, 186.6, 144.5 };
 
 // ----- Pressure Sensor Parameters -----
-// Pressure sensor outputs 0.5V at 0 Bar and 4.5V at 10 Bar.
-// Datasheet formula: Vout = (0.0008 * (pressure in kPa) + 0.1) * 5
-// Solve for pressure (kPa): pressure_kPa = (Vout - 0.5) / 0.004
-// Optionally, pressure in bar = pressure_kPa / 100
+// 0.5 V offset at 0 bar, ratiometric to 5 V. Scale is pressSensMvPerBar (web setting).
+// PST-F 1 10 bar:  400 mV/bar   (0.5–4.5 V = 0–10 bar)
+// PST-F 2 280 bar: 14.3 mV/bar  (0.5–4.5 V = 0–280 bar)
+// PST-F 2 350 bar: 11.43 mV/bar (0.5–4.5 V = 0–350 bar)
+const float PRESS_OFFSET_V = 0.5f;
 
 // Function to linearly interpolate the temperature based on sensor resistance
 float interpolateTemperature(float resistance) {
@@ -219,12 +224,35 @@ void sendGPSConfig() {
   delay(100);
   Serial1.println("$PCAS11,3*1E"); //automotive mode
   delay(100);
-  Serial1.println("$PCAS03,1,0,0,0,0,1,0,,,,,,,*32"); //only GGA+VTG output
+  Serial1.println("$PCAS03,1,0,0,0,1,0,0,,,,,,,*32"); //only GGA+RMC output
   delay(100);
   Serial1.println("$PCAS02,100*1E"); //10Hz update rate
   delay(100);
   Serial1.println("$PCAS01,5*19"); //baud -> 115200 (module switches now)
   delay(200);
+}
+
+//Append NMEA XOR checksum (*HH) if the sentence has $ and no checksum yet.
+String applyNmeaChecksum(String s) {
+  s.trim();
+  if (s.length() == 0) return s;
+  if (s.charAt(0) == '$' && s.indexOf('*') < 0) {
+    uint8_t cs = 0;
+    for (unsigned i = 1; i < s.length(); i++) {
+      cs ^= (uint8_t)s.charAt(i);
+    }
+    char hex[5];
+    snprintf(hex, sizeof(hex), "*%02X", cs);
+    s += hex;
+  }
+  return s;
+}
+
+void flushGpsCmd() {
+  if (!gpsCmdPending) return;
+  Serial1.println(gpsCmdBuf);
+  logPrint(String("GPS cmd sent: ") + gpsCmdBuf);
+  gpsCmdPending = false;
 }
 
 //Detects current module state and gets it (and our UART) onto 115200/10Hz/GPS-only.
@@ -249,6 +277,8 @@ void setupGPS() {
     sendGPSConfig();
     Serial1.begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
     delay(100);
+    Serial1.println("$PCAS00*01");  // save to flash
+    delay(200);
     logPrint("GPS: reconfigured and switched to 115200");
     return;
   }
@@ -682,13 +712,12 @@ long getTemp(bool imper) {
 
 // ----- Pressure Sensor on ADS1115 Channel 1 -----
 float getPress(bool PSI) {
-  // pressure_kPa = (Vout - 0.5) / 0.004
-  float tst = ads.readADC_SingleEnded(1);
-  float pressure_kPa = (ads.computeVolts(tst) - 0.5) / 0.004;
+  float volts = ads.computeVolts(ads.readADC_SingleEnded(1));
+  float pressure_bar = (volts - PRESS_OFFSET_V) / (pressSensMvPerBar * 0.001f);
   if(PSI) {
-    return (round(pressure_kPa*1.45038)/10.0); //in PSI;
+    return (round(pressure_bar * 145.038f) / 10.0); // in PSI, 1 decimal
   } else {
-    return (pressure_kPa / 100.0); //In bar
+    return pressure_bar;
   }
 }
 
@@ -709,6 +738,7 @@ void saveSettings() {
   preferences.begin("settings", false);
   preferences.putInt("aTemp",alarmTemp);
   preferences.putFloat("aPress",alarmPress);
+  preferences.putFloat("pSens",pressSensMvPerBar);
   preferences.putBool("uImp",useImperial);
   preferences.putBool("uPSI",usePSI);
   preferences.putBool("invrt",invertOutput);
@@ -724,6 +754,7 @@ String settingsToJson() {
   String j = "{";
   j += "\"aTemp\":" + String(alarmTemp) + ",";
   j += "\"aPress\":" + String(alarmPress, 1) + ",";
+  j += "\"pSens\":" + String(pressSensMvPerBar, 2) + ",";
   j += "\"uImp\":" + String(useImperial ? "true" : "false") + ",";
   j += "\"uPSI\":" + String(usePSI ? "true" : "false") + ",";
   j += "\"invrt\":" + String(invertOutput ? "true" : "false") + ",";
@@ -846,6 +877,12 @@ void setupWebServer() {
       alarmTemp = request->getParam("aTemp", true)->value().toInt();
     if (request->hasParam("aPress", true))
       alarmPress = request->getParam("aPress", true)->value().toFloat();
+    if (request->hasParam("pSens", true)) {
+      float mv = request->getParam("pSens", true)->value().toFloat();
+      if (mv >= 1.0f && mv <= 1000.0f) {
+        pressSensMvPerBar = mv;
+      }
+    }
     if (request->hasParam("uImp", true))
       useImperial = request->getParam("uImp", true)->value() == "1" || request->getParam("uImp", true)->value() == "true";
     if (request->hasParam("uPSI", true))
@@ -871,6 +908,37 @@ void setupWebServer() {
     }
     saveSettings();
     request->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/api/gps", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("cmd", true)) {
+      request->send(400, "application/json", "{\"ok\":false,\"error\":\"missing cmd\"}");
+      return;
+    }
+    if (gpsCmdPending) {
+      request->send(409, "application/json", "{\"ok\":false,\"error\":\"busy\"}");
+      return;
+    }
+    String cmd = applyNmeaChecksum(request->getParam("cmd", true)->value());
+    if (cmd.length() == 0) {
+      request->send(400, "application/json", "{\"ok\":false,\"error\":\"empty cmd\"}");
+      return;
+    }
+    if (cmd.length() >= GPS_CMD_MAX) {
+      request->send(400, "application/json", "{\"ok\":false,\"error\":\"cmd too long\"}");
+      return;
+    }
+    for (unsigned i = 0; i < cmd.length(); i++) {
+      char c = cmd.charAt(i);
+      if (c < 32 || c > 126 || c == '"' || c == '\\') {
+        request->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid chars\"}");
+        return;
+      }
+    }
+    strncpy(gpsCmdBuf, cmd.c_str(), GPS_CMD_MAX - 1);
+    gpsCmdBuf[GPS_CMD_MAX - 1] = '\0';
+    gpsCmdPending = true;
+    request->send(200, "application/json", "{\"ok\":true,\"sent\":\"" + cmd + "\"}");
   });
 
   server.on("/api/rides", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -946,6 +1014,10 @@ void setup() {
   preferences.begin("settings", true); //preferences.putUInt("counter", counter);
   alarmTemp = preferences.getInt("aTemp",130);
   alarmPress = preferences.getFloat("aPress",1.0);
+  pressSensMvPerBar = preferences.getFloat("pSens",400.0f);
+  if (pressSensMvPerBar < 1.0f || pressSensMvPerBar > 1000.0f) {
+    pressSensMvPerBar = 400.0f;
+  }
   useImperial = preferences.getBool("uImp",false);
   usePSI = preferences.getBool("uPSI",false);
   invertOutput = preferences.getBool("invrt",false);
@@ -994,6 +1066,8 @@ void loop(void) {
     tftPowerPending = false;
     applyTftPower();
   }
+
+  flushGpsCmd();
 
   //Feed gps
   while(Serial1.available() > 0) {

@@ -27,11 +27,23 @@
   .row:last-child { border-bottom:0; }
   label { color:var(--muted); }
   input[type=number] { width:90px; padding:6px; background:#000; color:var(--fg); border:1px solid var(--line); border-radius:4px; }
+  input[type=text] {
+    width:100%; padding:8px; background:#000; color:var(--fg);
+    border:1px solid var(--line); border-radius:4px; font:inherit;
+    font-family:ui-monospace,Consolas,monospace;
+  }
   input[type=checkbox] { width:18px; height:18px; }
   .actions { margin-top:12px; display:flex; gap:8px; align-items:center; }
+  .gps-row { display:flex; gap:8px; align-items:center; }
+  .gps-row input { flex:1; min-width:0; }
+  .hint { color:var(--muted); font-size:.85rem; margin:8px 0 0; }
   #saveMsg { color:var(--acc); font-size:.9rem; }
+  #gpsMsg { font-size:.9rem; margin:8px 0 0; color:var(--muted); }
+  #gpsMsg.ok { color:var(--acc); }
+  #gpsMsg.err { color:#f66; }
   .graph-controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:center; margin-bottom:10px; }
   select { padding:8px; background:#000; color:var(--fg); border:1px solid var(--line); border-radius:4px; min-width:160px; }
+  .settings select { min-width:0; max-width:68%; flex:1; }
   canvas { width:100%; max-width:100%; background:#000; border:1px solid var(--line); border-radius:8px; touch-action:none; }
   .legend { display:flex; gap:14px; flex-wrap:wrap; margin-top:8px; color:var(--muted); font-size:.9rem; }
   .legend span::before { content:""; display:inline-block; width:12px; height:3px; margin-right:6px; vertical-align:middle; }
@@ -56,6 +68,13 @@
   <div class="settings" id="settings">
     <div class="row"><label for="aTemp">Temp alarm</label><input id="aTemp" type="number" step="1"></div>
     <div class="row"><label for="aPress">Press alarm</label><input id="aPress" type="number" step="0.1"></div>
+    <div class="row"><label for="pSens">Pressure sensor</label>
+      <select id="pSens">
+        <option value="400">PST-F 1 · 10 bar (400 mV/bar)</option>
+        <option value="14.3">PST-F 2 · 280 bar (14.3 mV/bar)</option>
+        <option value="11.43">PST-F 2 · 350 bar (11.43 mV/bar)</option>
+      </select>
+    </div>
     <div class="row"><label for="uPSI">Use PSI</label><input id="uPSI" type="checkbox"></div>
     <div class="row"><label for="uImp">Use imperial</label><input id="uImp" type="checkbox"></div>
     <div class="row"><label for="invrt">Invert output</label><input id="invrt" type="checkbox"></div>
@@ -67,6 +86,16 @@
       <button id="saveBtn" type="button">Save</button>
       <span id="saveMsg"></span>
     </div>
+  </div>
+
+  <h2>GPS command</h2>
+  <div class="settings">
+    <div class="gps-row">
+      <input id="gpsCmd" type="text" placeholder="$PCAS00*01" autocomplete="off" spellcheck="off" autocapitalize="off">
+      <button id="gpsSendBtn" type="button">Send</button>
+    </div>
+    <p class="hint">CASIC NMEA to the GPS UART. Checksum (*HH) is added if you omit it. ESP stays at 115200 — don't change module baud unless you match it.</p>
+    <p id="gpsMsg"></p>
   </div>
 
   <h2>Ride graph</h2>
@@ -92,11 +121,32 @@ let samples = []; // {t, tempC, pressBar, speedKmh}
 
 function $(id) { return document.getElementById(id); }
 
+const PRESS_PRESETS = [
+  { value: '400', mv: 400 },
+  { value: '14.3', mv: 14.3 },
+  { value: '11.43', mv: 11.43 }
+];
+
+function pressPresetValue(mv) {
+  const n = Number(mv);
+  let best = PRESS_PRESETS[0].value;
+  let bestDiff = Infinity;
+  for (const p of PRESS_PRESETS) {
+    const d = Math.abs(p.mv - n);
+    if (d < bestDiff) {
+      bestDiff = d;
+      best = p.value;
+    }
+  }
+  return best;
+}
+
 async function loadSettings() {
   const r = await fetch('/api/settings');
   settings = await r.json();
   $('aTemp').value = settings.aTemp;
   $('aPress').value = settings.aPress;
+  $('pSens').value = pressPresetValue(settings.pSens);
   $('uImp').checked = !!settings.uImp;
   $('uPSI').checked = !!settings.uPSI;
   $('invrt').checked = !!settings.invrt;
@@ -111,6 +161,7 @@ async function saveSettings() {
   const body = new URLSearchParams();
   body.set('aTemp', $('aTemp').value);
   body.set('aPress', $('aPress').value);
+  body.set('pSens', $('pSens').value);
   body.set('uImp', $('uImp').checked ? 'true' : 'false');
   body.set('uPSI', $('uPSI').checked ? 'true' : 'false');
   body.set('invrt', $('invrt').checked ? 'true' : 'false');
@@ -127,6 +178,7 @@ async function saveSettings() {
   if (r.ok) {
     settings.aTemp = Number($('aTemp').value);
     settings.aPress = Number($('aPress').value);
+    settings.pSens = Number($('pSens').value);
     settings.uImp = $('uImp').checked;
     settings.uPSI = $('uPSI').checked;
     updateLegendUnits();
@@ -367,7 +419,42 @@ function drawChart() {
   if (scaleS) strokeSeries(scaleS, '#6f6', p => p.speed);
 }
 
+async function sendGpsCmd() {
+  const raw = $('gpsCmd').value.trim();
+  if (!raw) {
+    $('gpsMsg').textContent = 'Enter a command';
+    $('gpsMsg').className = 'err';
+    return;
+  }
+  $('gpsSendBtn').disabled = true;
+  $('gpsMsg').className = '';
+  $('gpsMsg').textContent = 'Sending…';
+  try {
+    const body = new URLSearchParams();
+    body.set('cmd', raw);
+    const r = await fetch('/api/gps', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString()
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) {
+      $('gpsMsg').textContent = 'Sent ' + (j.sent || raw);
+      $('gpsMsg').className = 'ok';
+    } else {
+      $('gpsMsg').textContent = 'Failed: ' + (j.error || r.status);
+      $('gpsMsg').className = 'err';
+    }
+  } catch (e) {
+    $('gpsMsg').textContent = String(e);
+    $('gpsMsg').className = 'err';
+  }
+  $('gpsSendBtn').disabled = false;
+}
+
 $('saveBtn').addEventListener('click', saveSettings);
+$('gpsSendBtn').addEventListener('click', sendGpsCmd);
+$('gpsCmd').addEventListener('keydown', e => { if (e.key === 'Enter') sendGpsCmd(); });
 $('reloadRides').addEventListener('click', loadRides);
 $('rideSelect').addEventListener('change', e => loadRide(e.target.value));
 ['showTemp','showPress','showSpeed'].forEach(id => $(id).addEventListener('change', drawChart));
