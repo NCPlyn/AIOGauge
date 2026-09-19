@@ -41,16 +41,34 @@
   #gpsMsg { font-size:.9rem; margin:8px 0 0; color:var(--muted); }
   #gpsMsg.ok { color:var(--acc); }
   #gpsMsg.err { color:#f66; }
-  .graph-controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:center; margin-bottom:10px; }
-  select { padding:8px; background:#000; color:var(--fg); border:1px solid var(--line); border-radius:4px; min-width:160px; }
   .settings select { min-width:0; max-width:68%; flex:1; }
-  canvas { width:100%; max-width:100%; background:#000; border:1px solid var(--line); border-radius:8px; touch-action:none; }
+  .err { color:#f66; }
+</style>
+<style id="graph-css">
+  .graph-controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:center; margin-bottom:10px; }
+  .graph-controls label { display:inline-flex; align-items:center; gap:4px; color:var(--fg); }
+  select { padding:8px; background:#000; color:var(--fg); border:1px solid var(--line); border-radius:4px; min-width:160px; }
+  #chart {
+    width:100%; max-width:100%; height:auto; aspect-ratio:2.15 / 1; min-height:220px;
+    background:#000; border:1px solid var(--line); border-radius:8px;
+    touch-action:none; user-select:none; display:block;
+  }
   .legend { display:flex; gap:14px; flex-wrap:wrap; margin-top:8px; color:var(--muted); font-size:.9rem; }
   .legend span::before { content:""; display:inline-block; width:12px; height:3px; margin-right:6px; vertical-align:middle; }
   .lg-temp::before { background:#f66; }
   .lg-press::before { background:#6cf; }
   .lg-speed::before { background:#6f6; }
-  .err { color:#f66; }
+  .graph-hint { color:var(--muted); font-size:.8rem; text-align:center; margin:8px 0 0; }
+  button.active { background:#2a6248; box-shadow:inset 0 0 0 1px var(--acc); }
+  .stats { margin-top:10px; background:var(--card); border-radius:8px; padding:10px 12px; font-size:.85rem; }
+  .stats-range { color:var(--muted); margin-bottom:8px; }
+  .stats-grid { display:grid; grid-template-columns:1fr; gap:8px; }
+  @media (min-width:520px) { .stats-grid { grid-template-columns:1fr 1fr 1fr; } }
+  .stats-item b { display:block; margin-bottom:2px; }
+  .stats-item.st-temp { color:#f66; }
+  .stats-item.st-press { color:#6cf; }
+  .stats-item.st-speed { color:#6f6; }
+  .stats-item span { color:var(--fg); font-variant-numeric:tabular-nums; }
 </style>
 </head>
 <body>
@@ -104,13 +122,27 @@
     <label><input id="showTemp" type="checkbox" checked> Temp</label>
     <label><input id="showPress" type="checkbox" checked> Press</label>
     <label><input id="showSpeed" type="checkbox" checked> Speed</label>
+  </div>
+  <div class="graph-controls">
     <button class="secondary" id="reloadRides" type="button">Reload</button>
+    <button class="secondary" id="resetViewBtn" type="button">Reset</button>
+    <button class="secondary" id="selBtn" type="button">Sel</button>
+    <button class="secondary" id="exportBtn" type="button">Export</button>
   </div>
   <canvas id="chart" width="720" height="320"></canvas>
+  <p class="graph-hint">Pinch zoom · drag pan · tap values · double-tap reset</p>
   <div class="legend">
     <span class="lg-temp" id="legTemp">Temp</span>
     <span class="lg-press" id="legPress">Press</span>
     <span class="lg-speed" id="legSpeed">Speed</span>
+  </div>
+  <div class="stats" id="stats">
+    <div class="stats-range" id="statsRange">No data</div>
+    <div class="stats-grid">
+      <div class="stats-item st-temp"><b id="stTempLabel">Temp</b><span id="stTemp">—</span></div>
+      <div class="stats-item st-press"><b id="stPressLabel">Press</b><span id="stPress">—</span></div>
+      <div class="stats-item st-speed"><b id="stSpeedLabel">Speed</b><span id="stSpeed">—</span></div>
+    </div>
   </div>
   <p id="graphMsg" class="err"></p>
 </main>
@@ -183,24 +215,9 @@ async function saveSettings() {
     settings.uPSI = $('uPSI').checked;
     updateLegendUnits();
     drawChart();
+    updateStats();
     setTimeout(() => { $('saveMsg').textContent = ''; }, 2000);
   }
-}
-
-function updateLegendUnits() {
-  const tUnit = settings.uImp ? '°F' : '°C';
-  const pUnit = settings.uPSI ? 'PSI' : 'bar';
-  const sUnit = settings.uImp ? 'mph' : 'km/h';
-  $('legTemp').textContent = 'Temp (' + tUnit + ')';
-  $('legPress').textContent = 'Press (' + pUnit + ')';
-  $('legSpeed').textContent = 'Speed (' + sUnit + ')';
-}
-
-function toDisplay(s) {
-  const temp = settings.uImp ? (s.tempC * 9 / 5 + 32) : s.tempC;
-  const press = settings.uPSI ? (s.pressBar * 14.5038) : s.pressBar;
-  const speed = s.speedKmh < 0 ? null : (settings.uImp ? s.speedKmh / 1.60934 : s.speedKmh);
-  return { t: s.t, temp, press, speed };
 }
 
 async function loadRides() {
@@ -213,7 +230,7 @@ async function loadRides() {
     if (!rides.length) {
       sel.innerHTML = '<option value="">No rides</option>';
       samples = [];
-      drawChart();
+      resetView();
       return;
     }
     for (const ride of rides) {
@@ -234,7 +251,7 @@ async function loadRides() {
 async function loadRide(id) {
   $('graphMsg').textContent = '';
   samples = [];
-  if (!id) { drawChart(); return; }
+  if (!id) { resetView(); return; }
   try {
     const r = await fetch('/api/ride?id=' + encodeURIComponent(id));
     if (!r.ok) throw new Error('Ride ' + id + ' not found');
@@ -250,173 +267,11 @@ async function loadRide(id) {
         speedKmh: view.getInt16(o + 4, true)
       });
     }
-    drawChart();
+    resetView();
   } catch (e) {
     $('graphMsg').textContent = String(e);
-    drawChart();
+    resetView();
   }
-}
-
-function drawChart() {
-  const canvas = $('chart');
-  const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, W, H);
-
-  const showT = $('showTemp').checked;
-  const showP = $('showPress').checked;
-  const showS = $('showSpeed').checked;
-  if (!samples.length || (!showT && !showP && !showS)) {
-    ctx.fillStyle = '#666';
-    ctx.font = '14px sans-serif';
-    ctx.fillText('No data', 20, 30);
-    return;
-  }
-
-  const pts = samples.map(toDisplay);
-  const axisW = 44;
-  const leftAxes = (showT ? 1 : 0);
-  const rightAxes = (showP ? 1 : 0) + (showS ? 1 : 0);
-  const padL = 8 + leftAxes * axisW;
-  const padR = 8 + rightAxes * axisW;
-  const padT = 16, padB = 36;
-  const plotW = W - padL - padR;
-  const plotH = H - padT - padB;
-  const tMax = Math.max(pts[pts.length - 1].t, 1);
-  const alarmTempDisp = Number(settings.aTemp);
-  const alarmPressDisp = Number(settings.aPress);
-
-  function makeScale(getter, extra) {
-    let lo = Infinity, hi = -Infinity;
-    for (const p of pts) {
-      const v = getter(p);
-      if (v == null || !isFinite(v)) continue;
-      lo = Math.min(lo, v);
-      hi = Math.max(hi, v);
-    }
-    if (extra != null && isFinite(extra)) {
-      lo = Math.min(lo, extra);
-      hi = Math.max(hi, extra);
-    }
-    if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
-    if (hi === lo) { hi += 1; lo -= 1; }
-    const pad = (hi - lo) * 0.08;
-    lo -= pad; hi += pad;
-    return {
-      lo, hi,
-      yOf: v => padT + plotH - ((v - lo) / (hi - lo)) * plotH
-    };
-  }
-
-  const scaleT = showT ? makeScale(p => p.temp, alarmTempDisp) : null;
-  const scaleP = showP ? makeScale(p => p.press, alarmPressDisp) : null;
-  const scaleS = showS ? makeScale(p => p.speed, null) : null;
-
-  const xOf = t => padL + (t / tMax) * plotW;
-
-  // Plot frame + time grid
-  ctx.strokeStyle = '#333';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(padL, padT);
-  ctx.lineTo(padL, padT + plotH);
-  ctx.lineTo(padL + plotW, padT + plotH);
-  ctx.lineTo(padL + plotW, padT);
-  ctx.closePath();
-  ctx.stroke();
-
-  ctx.font = '11px sans-serif';
-  for (let i = 0; i <= 4; i++) {
-    const t = (tMax * i) / 4;
-    const x = xOf(t);
-    ctx.strokeStyle = '#222';
-    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
-    ctx.fillStyle = '#888';
-    ctx.fillText(t.toFixed(0) + 's', x - 10, H - 12);
-  }
-
-  function drawAxis(scale, color, x, alignRight) {
-    ctx.strokeStyle = color;
-    ctx.fillStyle = color;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(x, padT);
-    ctx.lineTo(x, padT + plotH);
-    ctx.stroke();
-    for (let i = 0; i <= 4; i++) {
-      const v = scale.lo + ((scale.hi - scale.lo) * (4 - i)) / 4;
-      const y = scale.yOf(v);
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      ctx.lineTo(alignRight ? x + 5 : x - 5, y);
-      ctx.stroke();
-      const label = Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1);
-      if (alignRight) {
-        ctx.textAlign = 'left';
-        ctx.fillText(label, x + 8, y + 3);
-      } else {
-        ctx.textAlign = 'right';
-        ctx.fillText(label, x - 8, y + 3);
-      }
-    }
-    ctx.textAlign = 'left';
-  }
-
-  let leftX = padL;
-  let rightSlot = 0;
-  if (scaleT) {
-    drawAxis(scaleT, '#f66', leftX, false);
-  }
-  if (scaleP) {
-    drawAxis(scaleP, '#6cf', padL + plotW + rightSlot * axisW, true);
-    rightSlot++;
-  }
-  if (scaleS) {
-    drawAxis(scaleS, '#6f6', padL + plotW + rightSlot * axisW, true);
-  }
-
-  function strokeSeries(scale, color, getter) {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    let started = false;
-    for (const p of pts) {
-      const v = getter(p);
-      if (v == null || !isFinite(v)) { started = false; continue; }
-      const x = xOf(p.t), y = scale.yOf(v);
-      if (!started) { ctx.moveTo(x, y); started = true; }
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-  }
-
-  function drawAlarmLine(scale, value, color, label) {
-    if (!scale || !isFinite(value)) return;
-    const y = scale.yOf(value);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash([6, 4]);
-    ctx.beginPath();
-    ctx.moveTo(padL, y);
-    ctx.lineTo(padL + plotW, y);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = color;
-    ctx.font = '11px sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillText(label, padL + 4, y - 4);
-  }
-
-  if (scaleT) {
-    strokeSeries(scaleT, '#f66', p => p.temp);
-    drawAlarmLine(scaleT, alarmTempDisp, '#f66', 'Temp alarm');
-  }
-  if (scaleP) {
-    strokeSeries(scaleP, '#6cf', p => p.press);
-    drawAlarmLine(scaleP, alarmPressDisp, '#6cf', 'Press alarm');
-  }
-  if (scaleS) strokeSeries(scaleS, '#6f6', p => p.speed);
 }
 
 async function sendGpsCmd() {
@@ -455,21 +310,771 @@ async function sendGpsCmd() {
 $('saveBtn').addEventListener('click', saveSettings);
 $('gpsSendBtn').addEventListener('click', sendGpsCmd);
 $('gpsCmd').addEventListener('keydown', e => { if (e.key === 'Enter') sendGpsCmd(); });
-$('reloadRides').addEventListener('click', loadRides);
-$('rideSelect').addEventListener('change', e => loadRide(e.target.value));
-['showTemp','showPress','showSpeed'].forEach(id => $(id).addEventListener('change', drawChart));
 ['uImp','uPSI'].forEach(id => $(id).addEventListener('change', () => {
   settings.uImp = $('uImp').checked;
   settings.uPSI = $('uPSI').checked;
   updateLegendUnits();
   drawChart();
+  updateStats();
 }));
 ['aTemp','aPress'].forEach(id => $(id).addEventListener('input', () => {
   settings.aTemp = Number($('aTemp').value);
   settings.aPress = Number($('aPress').value);
   drawChart();
 }));
+</script>
+<script id="chart-core">
+let viewStart = 0, viewEnd = Infinity;
+let selStart = null, selEnd = null;
+let selectMode = false;
+let hoverIdx = -1;
+let layout = null;
+let drawPending = false;
+const pointers = new Map();
+let gesture = null;
+let lastTap = { t: 0, x: 0, y: 0 };
 
+function units() {
+  return {
+    t: settings.uImp ? '°F' : '°C',
+    p: settings.uPSI ? 'PSI' : 'bar',
+    s: settings.uImp ? 'mph' : 'km/h'
+  };
+}
+
+function updateLegendUnits() {
+  const u = units();
+  const lt = $('legTemp'), lp = $('legPress'), ls = $('legSpeed');
+  if (lt) lt.textContent = 'Temp (' + u.t + ')';
+  if (lp) lp.textContent = 'Press (' + u.p + ')';
+  if (ls) ls.textContent = 'Speed (' + u.s + ')';
+  const st = $('stTempLabel'), sp = $('stPressLabel'), ss = $('stSpeedLabel');
+  if (st) st.textContent = 'Temp (' + u.t + ')';
+  if (sp) sp.textContent = 'Press (' + u.p + ')';
+  if (ss) ss.textContent = 'Speed (' + u.s + ')';
+}
+
+function toDisplay(s) {
+  const temp = settings.uImp ? (s.tempC * 9 / 5 + 32) : s.tempC;
+  const press = settings.uPSI ? (s.pressBar * 14.5038) : s.pressBar;
+  const speed = s.speedKmh < 0 ? null : (settings.uImp ? s.speedKmh / 1.60934 : s.speedKmh);
+  return { t: s.t, temp, press, speed };
+}
+
+function rideTMax() {
+  return samples.length ? samples[samples.length - 1].t : 1;
+}
+
+function minSpan() {
+  return Math.max(SAMPLE_DT * 8, 2);
+}
+
+function getView() {
+  const tmax = rideTMax();
+  let t0 = viewStart;
+  let t1 = (!isFinite(viewEnd) || viewEnd == null) ? tmax : viewEnd;
+  if (t1 <= t0) t1 = t0 + minSpan();
+  if (t0 < 0) { t1 -= t0; t0 = 0; }
+  if (t1 > tmax) { t0 -= (t1 - tmax); t1 = tmax; }
+  if (t0 < 0) t0 = 0;
+  if (t1 <= t0) t1 = Math.min(tmax, t0 + minSpan());
+  return { t0, t1, tmax };
+}
+
+function clampView() {
+  const v = getView();
+  viewStart = v.t0;
+  viewEnd = v.t1;
+}
+
+function resetView() {
+  viewStart = 0;
+  viewEnd = Infinity;
+  selStart = null;
+  selEnd = null;
+  hoverIdx = -1;
+  updateSelBtn();
+  drawChart();
+  updateStats();
+}
+
+function updateSelBtn() {
+  const btn = $('selBtn');
+  if (!btn) return;
+  btn.classList.toggle('active', selectMode);
+  if (selectMode) btn.textContent = 'Sel on';
+  else if (selStart != null && selEnd != null) btn.textContent = '✕ Sel';
+  else btn.textContent = 'Sel';
+}
+
+function seriesFlags() {
+  const t = $('showTemp'), p = $('showPress'), s = $('showSpeed');
+  return {
+    t: !t || t.checked,
+    p: !p || p.checked,
+    s: !s || s.checked
+  };
+}
+
+function nearestIndex(t) {
+  if (!samples.length) return -1;
+  let lo = 0, hi = samples.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (samples[mid].t < t) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo > 0 && Math.abs(samples[lo - 1].t - t) <= Math.abs(samples[lo].t - t)) return lo - 1;
+  return lo;
+}
+
+function formatTime(t) {
+  if (!isFinite(t) || t < 0) t = 0;
+  const m = Math.floor(t / 60);
+  const s = t - m * 60;
+  if (m <= 0) return s.toFixed(s >= 10 ? 0 : 1) + 's';
+  return m + ':' + (s < 10 ? '0' : '') + s.toFixed(s >= 10 ? 0 : 1);
+}
+
+function formatVal(v, digits) {
+  if (v == null || !isFinite(v)) return '—';
+  const d = digits == null ? (Math.abs(v) >= 100 ? 0 : 1) : digits;
+  return Number(v).toFixed(d);
+}
+
+function fmtStat(st, digits) {
+  if (!st || st.n === 0) return '—';
+  return 'min ' + formatVal(st.min, digits) +
+    '  /  max ' + formatVal(st.max, digits) +
+    '  /  avg ' + formatVal(st.avg, digits);
+}
+
+function computeStats(t0, t1) {
+  const acc = {
+    temp: { min: Infinity, max: -Infinity, sum: 0, n: 0 },
+    press: { min: Infinity, max: -Infinity, sum: 0, n: 0 },
+    speed: { min: Infinity, max: -Infinity, sum: 0, n: 0 }
+  };
+  function add(slot, v) {
+    if (v == null || !isFinite(v)) return;
+    if (v < slot.min) slot.min = v;
+    if (v > slot.max) slot.max = v;
+    slot.sum += v;
+    slot.n++;
+  }
+  for (const s of samples) {
+    if (s.t < t0 || s.t > t1) continue;
+    const d = toDisplay(s);
+    add(acc.temp, d.temp);
+    add(acc.press, d.press);
+    add(acc.speed, d.speed);
+  }
+  function fin(slot) {
+    if (!slot.n) return { n: 0 };
+    return { n: slot.n, min: slot.min, max: slot.max, avg: slot.sum / slot.n };
+  }
+  return { temp: fin(acc.temp), press: fin(acc.press), speed: fin(acc.speed) };
+}
+
+function statsRange() {
+  if (selStart != null && selEnd != null && Math.abs(selEnd - selStart) > SAMPLE_DT * 0.5) {
+    const a = Math.min(selStart, selEnd), b = Math.max(selStart, selEnd);
+    return { t0: a, t1: b, label: 'Selection ' + formatTime(a) + ' – ' + formatTime(b) };
+  }
+  const v = getView();
+  return { t0: v.t0, t1: v.t1, label: 'Visible ' + formatTime(v.t0) + ' – ' + formatTime(v.t1) };
+}
+
+function updateStats() {
+  const rangeEl = $('statsRange');
+  if (!rangeEl) return;
+  if (!samples.length) {
+    rangeEl.textContent = 'No data';
+    $('stTemp').textContent = '—';
+    $('stPress').textContent = '—';
+    $('stSpeed').textContent = '—';
+    return;
+  }
+  const r = statsRange();
+  const st = computeStats(r.t0, r.t1);
+  const u = units();
+  rangeEl.textContent = r.label + '  ·  ' + formatTime(r.t1 - r.t0);
+  $('stTemp').textContent = fmtStat(st.temp, settings.uImp ? 0 : 0);
+  $('stPress').textContent = fmtStat(st.press, settings.uPSI ? 0 : 1);
+  $('stSpeed').textContent = fmtStat(st.speed, 0);
+  $('stTempLabel').textContent = 'Temp (' + u.t + ')';
+  $('stPressLabel').textContent = 'Press (' + u.p + ')';
+  $('stSpeedLabel').textContent = 'Speed (' + u.s + ')';
+}
+
+function cssSize(canvas) {
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.max(1, rect.width);
+  const h = Math.max(1, rect.height);
+  return { w, h, rect };
+}
+
+function resizeCanvas() {
+  const canvas = $('chart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const { w, h } = cssSize(canvas);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  const bw = Math.round(w * dpr);
+  const bh = Math.round(h * dpr);
+  if (canvas.width !== bw || canvas.height !== bh) {
+    canvas.width = bw;
+    canvas.height = bh;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function eventCssXY(e, canvas) {
+  const rect = canvas.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
+function tFromCssX(x) {
+  if (!layout) return 0;
+  const r = (x - layout.padL) / layout.plotW;
+  return layout.t0 + r * (layout.t1 - layout.t0);
+}
+
+function scheduleDraw() {
+  if (drawPending) return;
+  drawPending = true;
+  requestAnimationFrame(() => {
+    drawPending = false;
+    drawChart();
+    updateStats();
+  });
+}
+
+function zoomAt(t, factor) {
+  clampView();
+  const span = viewEnd - viewStart;
+  const tmax = rideTMax();
+  let newSpan = span * factor;
+  newSpan = Math.max(minSpan(), Math.min(tmax, newSpan));
+  const ratio = span > 0 ? (t - viewStart) / span : 0.5;
+  viewStart = t - newSpan * ratio;
+  viewEnd = viewStart + newSpan;
+  clampView();
+  scheduleDraw();
+}
+
+function setHoverFromCssX(x) {
+  if (!samples.length || !layout) { hoverIdx = -1; return; }
+  const t = tFromCssX(x);
+  hoverIdx = nearestIndex(Math.max(layout.t0, Math.min(layout.t1, t)));
+}
+
+function drawChart() {
+  const canvas = $('chart');
+  if (!canvas) return;
+  resizeCanvas();
+  const ctx = canvas.getContext('2d');
+  const { w: W, h: H } = cssSize(canvas);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  const show = seriesFlags();
+  if (!samples.length || (!show.t && !show.p && !show.s)) {
+    layout = null;
+    ctx.fillStyle = '#666';
+    ctx.font = '14px sans-serif';
+    ctx.fillText('No data', 20, 30);
+    return;
+  }
+
+  const v = getView();
+  const t0 = v.t0, t1 = v.t1;
+  const iLo = Math.max(0, nearestIndex(t0) - 1);
+  const iHi = Math.min(samples.length - 1, nearestIndex(t1) + 1);
+  const pts = [];
+  for (let i = iLo; i <= iHi; i++) pts.push(toDisplay(samples[i]));
+
+  const axisW = 44;
+  const leftAxes = show.t ? 1 : 0;
+  const rightAxes = (show.p ? 1 : 0) + (show.s ? 1 : 0);
+  const padL = 8 + leftAxes * axisW;
+  const padR = 8 + rightAxes * axisW;
+  const padT = 16, padB = 36;
+  const plotW = Math.max(10, W - padL - padR);
+  const plotH = Math.max(10, H - padT - padB);
+  const span = Math.max(t1 - t0, 0.001);
+  const alarmTempDisp = Number(settings.aTemp);
+  const alarmPressDisp = Number(settings.aPress);
+
+  layout = { padL, padR, padT, padB, plotW, plotH, t0, t1, W, H };
+
+  function makeScale(getter, extra) {
+    let lo = Infinity, hi = -Infinity;
+    for (const p of pts) {
+      if (p.t < t0 || p.t > t1) continue;
+      const val = getter(p);
+      if (val == null || !isFinite(val)) continue;
+      lo = Math.min(lo, val);
+      hi = Math.max(hi, val);
+    }
+    if (extra != null && isFinite(extra)) {
+      lo = Math.min(lo, extra);
+      hi = Math.max(hi, extra);
+    }
+    if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
+    if (hi === lo) { hi += 1; lo -= 1; }
+    const pad = (hi - lo) * 0.08;
+    lo -= pad; hi += pad;
+    return {
+      lo, hi,
+      yOf: val => padT + plotH - ((val - lo) / (hi - lo)) * plotH
+    };
+  }
+
+  const scaleT = show.t ? makeScale(p => p.temp, alarmTempDisp) : null;
+  const scaleP = show.p ? makeScale(p => p.press, alarmPressDisp) : null;
+  const scaleS = show.s ? makeScale(p => p.speed, null) : null;
+  const xOf = t => padL + ((t - t0) / span) * plotW;
+
+  if (selStart != null && selEnd != null) {
+    const a = Math.min(selStart, selEnd), b = Math.max(selStart, selEnd);
+    const xA = Math.max(padL, Math.min(padL + plotW, xOf(a)));
+    const xB = Math.max(padL, Math.min(padL + plotW, xOf(b)));
+    if (xB > xA) {
+      ctx.fillStyle = 'rgba(58,170,120,0.18)';
+      ctx.fillRect(xA, padT, xB - xA, plotH);
+    }
+  }
+
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, padT + plotH);
+  ctx.lineTo(padL + plotW, padT + plotH);
+  ctx.lineTo(padL + plotW, padT);
+  ctx.closePath();
+  ctx.stroke();
+
+  ctx.font = '11px sans-serif';
+  for (let i = 0; i <= 4; i++) {
+    const t = t0 + (span * i) / 4;
+    const x = xOf(t);
+    ctx.strokeStyle = '#222';
+    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
+    ctx.fillStyle = '#888';
+    ctx.textAlign = 'center';
+    ctx.fillText(formatTime(t), x, H - 12);
+  }
+  ctx.textAlign = 'left';
+
+  function drawAxis(scale, color, x, alignRight) {
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x, padT);
+    ctx.lineTo(x, padT + plotH);
+    ctx.stroke();
+    for (let i = 0; i <= 4; i++) {
+      const val = scale.lo + ((scale.hi - scale.lo) * (4 - i)) / 4;
+      const y = scale.yOf(val);
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(alignRight ? x + 5 : x - 5, y);
+      ctx.stroke();
+      const label = Math.abs(val) >= 100 ? val.toFixed(0) : val.toFixed(1);
+      if (alignRight) {
+        ctx.textAlign = 'left';
+        ctx.fillText(label, x + 8, y + 3);
+      } else {
+        ctx.textAlign = 'right';
+        ctx.fillText(label, x - 8, y + 3);
+      }
+    }
+    ctx.textAlign = 'left';
+  }
+
+  let rightSlot = 0;
+  if (scaleT) drawAxis(scaleT, '#f66', padL, false);
+  if (scaleP) {
+    drawAxis(scaleP, '#6cf', padL + plotW + rightSlot * axisW, true);
+    rightSlot++;
+  }
+  if (scaleS) drawAxis(scaleS, '#6f6', padL + plotW + rightSlot * axisW, true);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(padL, padT, plotW, plotH);
+  ctx.clip();
+
+  function strokeSeries(scale, color, getter) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    for (const p of pts) {
+      const val = getter(p);
+      if (val == null || !isFinite(val)) { started = false; continue; }
+      const x = xOf(p.t), y = scale.yOf(val);
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  function drawAlarmLine(scale, value, color, label) {
+    if (!scale || !isFinite(value)) return;
+    const y = scale.yOf(value);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = color;
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(label, padL + 4, y - 4);
+  }
+
+  if (scaleT) {
+    strokeSeries(scaleT, '#f66', p => p.temp);
+    drawAlarmLine(scaleT, alarmTempDisp, '#f66', 'Temp alarm');
+  }
+  if (scaleP) {
+    strokeSeries(scaleP, '#6cf', p => p.press);
+    drawAlarmLine(scaleP, alarmPressDisp, '#6cf', 'Press alarm');
+  }
+  if (scaleS) strokeSeries(scaleS, '#6f6', p => p.speed);
+
+  if (hoverIdx >= 0 && hoverIdx < samples.length) {
+    const hs = toDisplay(samples[hoverIdx]);
+    const x = xOf(hs.t);
+    ctx.strokeStyle = '#aaa';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x, padT);
+    ctx.lineTo(x, padT + plotH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    function dot(scale, val, color) {
+      if (!scale || val == null || !isFinite(val)) return;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(x, scale.yOf(val), 4.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (scaleT) dot(scaleT, hs.temp, '#f66');
+    if (scaleP) dot(scaleP, hs.press, '#6cf');
+    if (scaleS) dot(scaleS, hs.speed, '#6f6');
+
+    const u = units();
+    const lines = [{ text: 't  ' + formatTime(hs.t), color: '#ccc' }];
+    if (show.t) lines.push({ text: 'T  ' + formatVal(hs.temp, 0) + ' ' + u.t, color: '#f66' });
+    if (show.p) lines.push({ text: 'P  ' + formatVal(hs.press, settings.uPSI ? 0 : 1) + ' ' + u.p, color: '#6cf' });
+    if (show.s) lines.push({ text: 'V  ' + formatVal(hs.speed, 0) + ' ' + u.s, color: '#6f6' });
+    ctx.font = '12px ui-monospace,Consolas,monospace';
+    let boxW = 0;
+    for (const line of lines) boxW = Math.max(boxW, ctx.measureText(line.text).width);
+    boxW += 16;
+    const boxH = lines.length * 16 + 10;
+    let bx = x + 10;
+    let by = padT + 8;
+    if (bx + boxW > padL + plotW - 4) bx = x - 10 - boxW;
+    if (bx < padL + 4) bx = padL + 4;
+    ctx.fillStyle = 'rgba(0,0,0,0.82)';
+    ctx.strokeStyle = '#555';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.rect(bx, by, boxW, boxH);
+    ctx.fill();
+    ctx.stroke();
+    ctx.textAlign = 'left';
+    for (let i = 0; i < lines.length; i++) {
+      ctx.fillStyle = lines[i].color;
+      ctx.fillText(lines[i].text, bx + 8, by + 18 + i * 16);
+    }
+  }
+
+  ctx.restore();
+}
+
+function pointerList() {
+  return Array.from(pointers.values());
+}
+
+function onPointerDown(e) {
+  const canvas = $('chart');
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  const pt = eventCssXY(e, canvas);
+  pointers.set(e.pointerId, { x: pt.x, y: pt.y, id: e.pointerId });
+  e.preventDefault();
+
+  if (pointers.size === 2) {
+    const pts = pointerList();
+    const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    const midX = (pts[0].x + pts[1].x) / 2;
+    clampView();
+    const span = viewEnd - viewStart;
+    const tFocus = tFromCssX(midX);
+    const ratio = span > 0 ? (tFocus - viewStart) / span : 0.5;
+    gesture = { type: 'pinch', dist0: Math.max(dist, 1), span0: span, tFocus: tFocus, ratio: ratio };
+    hoverIdx = -1;
+    return;
+  }
+
+  if (selectMode) {
+    gesture = { type: 'sel', x0: pt.x, t0: tFromCssX(pt.x), moved: false };
+    selStart = gesture.t0;
+    selEnd = gesture.t0;
+    hoverIdx = -1;
+    scheduleDraw();
+    return;
+  }
+
+  gesture = {
+    type: 'pan',
+    x0: pt.x, y0: pt.y,
+    v0: getView().t0, v1: getView().t1,
+    moved: false
+  };
+}
+
+function onPointerMove(e) {
+  const canvas = $('chart');
+  if (!pointers.has(e.pointerId) && e.pointerType === 'mouse' && pointers.size === 0 && !gesture) {
+    const pt = eventCssXY(e, canvas);
+    if (layout && pt.x >= layout.padL && pt.x <= layout.padL + layout.plotW) {
+      setHoverFromCssX(pt.x);
+      scheduleDraw();
+    } else if (hoverIdx !== -1) {
+      hoverIdx = -1;
+      scheduleDraw();
+    }
+    return;
+  }
+  if (!pointers.has(e.pointerId)) return;
+  const pt = eventCssXY(e, canvas);
+  pointers.set(e.pointerId, { x: pt.x, y: pt.y, id: e.pointerId });
+  e.preventDefault();
+
+  if (gesture && gesture.type === 'pinch' && pointers.size >= 2) {
+    const pts = pointerList();
+    const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    const tmax = rideTMax();
+    let newSpan = gesture.span0 * (gesture.dist0 / Math.max(dist, 1));
+    newSpan = Math.max(minSpan(), Math.min(tmax, newSpan));
+    viewStart = gesture.tFocus - newSpan * gesture.ratio;
+    viewEnd = viewStart + newSpan;
+    clampView();
+    scheduleDraw();
+    return;
+  }
+
+  if (gesture && gesture.type === 'sel') {
+    if (Math.abs(pt.x - gesture.x0) > 8) gesture.moved = true;
+    selStart = gesture.t0;
+    selEnd = tFromCssX(pt.x);
+    scheduleDraw();
+    return;
+  }
+
+  if (gesture && gesture.type === 'pan') {
+    const dx = pt.x - gesture.x0;
+    const dy = pt.y - gesture.y0;
+    if (!gesture.moved && Math.hypot(dx, dy) > 10) {
+      gesture.moved = true;
+      hoverIdx = -1;
+    }
+    if (gesture.moved && layout) {
+      const span = gesture.v1 - gesture.v0;
+      const dt = -(dx / layout.plotW) * span;
+      viewStart = gesture.v0 + dt;
+      viewEnd = gesture.v1 + dt;
+      clampView();
+      scheduleDraw();
+    }
+  }
+}
+
+function onPointerUp(e) {
+  const canvas = $('chart');
+  const had = pointers.has(e.pointerId);
+  pointers.delete(e.pointerId);
+  if (had) e.preventDefault();
+
+  if (pointers.size < 2 && gesture && gesture.type === 'pinch') {
+    gesture = null;
+    return;
+  }
+
+  if (gesture && gesture.type === 'sel' && pointers.size === 0) {
+    if (!gesture.moved) {
+      selStart = null;
+      selEnd = null;
+    } else if (Math.abs(selEnd - selStart) < SAMPLE_DT) {
+      selStart = null;
+      selEnd = null;
+    }
+    selectMode = false;
+    gesture = null;
+    updateSelBtn();
+    scheduleDraw();
+    return;
+  }
+
+  if (gesture && gesture.type === 'pan' && pointers.size === 0) {
+    const pt = eventCssXY(e, canvas);
+    if (!gesture.moved) {
+      const now = Date.now();
+      const dt = now - lastTap.t;
+      const dist = Math.hypot(pt.x - lastTap.x, pt.y - lastTap.y);
+      if (dt < 320 && dist < 36) {
+        lastTap.t = 0;
+        resetView();
+      } else {
+        lastTap = { t: now, x: pt.x, y: pt.y };
+        setHoverFromCssX(pt.x);
+        scheduleDraw();
+      }
+    }
+    gesture = null;
+  }
+}
+
+function onPointerLeave(e) {
+  if (e.pointerType === 'mouse' && pointers.size === 0 && !gesture) {
+    hoverIdx = -1;
+    scheduleDraw();
+  }
+}
+
+function onWheel(e) {
+  e.preventDefault();
+  if (!layout || !samples.length) return;
+  const pt = eventCssXY(e, $('chart'));
+  const t = tFromCssX(pt.x);
+  zoomAt(t, e.deltaY > 0 ? 1.18 : 0.85);
+}
+
+function exportRide() {
+  if (!samples.length) {
+    const msg = $('graphMsg');
+    if (msg) msg.textContent = 'No ride to export';
+    return;
+  }
+  const sel = $('rideSelect');
+  const id = (sel && sel.value) ? sel.value : 'ride';
+  const cssEl = $('graph-css');
+  const coreEl = $('chart-core');
+  const css = cssEl ? cssEl.textContent : '';
+  const core = coreEl ? coreEl.textContent : '';
+  const packed = samples.map(s => [Math.round(s.pressBar * 100), s.tempC, s.speedKmh]);
+  const snap = {
+    uImp: !!settings.uImp,
+    uPSI: !!settings.uPSI,
+    aTemp: Number(settings.aTemp),
+    aPress: Number(settings.aPress)
+  };
+  const html = '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>AIOGauge Ride #' + id + '</title><style>' +
+    ':root{--bg:#111;--fg:#eee;--muted:#999;--acc:#3a7;--line:#333;--card:#1a1a1a;}' +
+    '*{box-sizing:border-box;}body{margin:0;font:15px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--fg);}' +
+    'main{max-width:720px;margin:0 auto;padding:16px;}h1{font-size:1.4rem;margin:0 0 12px;}' +
+    'button{display:inline-block;padding:10px 14px;background:var(--acc);color:#fff;border:0;border-radius:6px;cursor:pointer;font:inherit;}' +
+    'button.secondary{background:#444;}input[type=checkbox]{width:18px;height:18px;}' +
+    css + '</style></head><body><main>' +
+    '<h1>AIOGauge · Ride #' + id + '</h1>' +
+    '<div class="graph-controls">' +
+    '<label><input id="showTemp" type="checkbox" checked> Temp</label>' +
+    '<label><input id="showPress" type="checkbox" checked> Press</label>' +
+    '<label><input id="showSpeed" type="checkbox" checked> Speed</label>' +
+    '<button class="secondary" id="resetViewBtn" type="button">Reset</button>' +
+    '<button class="secondary" id="selBtn" type="button">Sel</button>' +
+    '</div>' +
+    '<canvas id="chart" width="720" height="320"></canvas>' +
+    '<p class="graph-hint">Pinch zoom · drag pan · tap values · double-tap reset</p>' +
+    '<div class="legend">' +
+    '<span class="lg-temp" id="legTemp">Temp</span>' +
+    '<span class="lg-press" id="legPress">Press</span>' +
+    '<span class="lg-speed" id="legSpeed">Speed</span>' +
+    '</div>' +
+    '<div class="stats" id="stats">' +
+    '<div class="stats-range" id="statsRange">No data</div>' +
+    '<div class="stats-grid">' +
+    '<div class="stats-item st-temp"><b id="stTempLabel">Temp</b><span id="stTemp">—</span></div>' +
+    '<div class="stats-item st-press"><b id="stPressLabel">Press</b><span id="stPress">—</span></div>' +
+    '<div class="stats-item st-speed"><b id="stSpeedLabel">Speed</b><span id="stSpeed">—</span></div>' +
+    '</div></div></main><script>' +
+    'const SAMPLE_DT=' + SAMPLE_DT + ';' +
+    'const settings=' + JSON.stringify(snap) + ';' +
+    'const packed=' + JSON.stringify(packed) + ';' +
+    'const samples=[];' +
+    'for(let i=0;i<packed.length;i++)samples.push({t:i*SAMPLE_DT,pressBar:packed[i][0]/100,tempC:packed[i][1],speedKmh:packed[i][2]});' +
+    'function $(id){return document.getElementById(id);}' +
+    core +
+    'bootGraph();updateLegendUnits();drawChart();updateStats();' +
+    '<\/script></body></html>';
+
+  const blob = new Blob([html], { type: 'text/html' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'aio-ride-' + id + '.html';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+function bootGraph() {
+  const canvas = $('chart');
+  if (!canvas) return;
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerup', onPointerUp);
+  canvas.addEventListener('pointercancel', onPointerUp);
+  canvas.addEventListener('pointerleave', onPointerLeave);
+  canvas.addEventListener('wheel', onWheel, { passive: false });
+  canvas.addEventListener('dblclick', e => { e.preventDefault(); resetView(); });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  ['showTemp', 'showPress', 'showSpeed'].forEach(id => {
+    const el = $(id);
+    if (el) el.addEventListener('change', () => { drawChart(); updateStats(); });
+  });
+  const resetBtn = $('resetViewBtn');
+  if (resetBtn) resetBtn.addEventListener('click', resetView);
+  const selBtn = $('selBtn');
+  if (selBtn) selBtn.addEventListener('click', () => {
+    if (!selectMode && selStart != null) {
+      selStart = null;
+      selEnd = null;
+      selectMode = false;
+      updateSelBtn();
+      scheduleDraw();
+      return;
+    }
+    selectMode = !selectMode;
+    updateSelBtn();
+  });
+  const exportBtn = $('exportBtn');
+  if (exportBtn) exportBtn.addEventListener('click', exportRide);
+  const reload = $('reloadRides');
+  if (reload) reload.addEventListener('click', loadRides);
+  const rideSel = $('rideSelect');
+  if (rideSel) rideSel.addEventListener('change', e => loadRide(e.target.value));
+  window.addEventListener('resize', () => { drawChart(); });
+  updateSelBtn();
+}
+</script>
+<script>
+bootGraph();
 loadSettings().then(loadRides).catch(e => { $('graphMsg').textContent = String(e); });
 </script>
 </body>
